@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🗜️ pi-cache-compact
+# 🗜️ pi-cache-compact-preserved-messages
 
 **Cache-friendly context compaction for [Pi](https://pi.dev).**
 
@@ -11,7 +11,7 @@ For locally hosted models, where prefilling a large context is the expensive par
 
 [Install](#install) · [Configure](#configure) · [How it works](#how-it-works) · [Caveats](#caveats) · [Develop](#develop)
 
-[![npm](https://img.shields.io/npm/v/pi-cache-compact?color=8B5CF6&style=flat-square)](https://www.npmjs.com/package/pi-cache-compact)
+[![npm](https://img.shields.io/npm/v/pi-cache-compact-preserved-messages?color=8B5CF6&style=flat-square)](https://www.npmjs.com/package/pi-cache-compact-preserved-messages)
 ![tests](https://img.shields.io/badge/tests-79-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
@@ -67,7 +67,7 @@ Requires Pi with the `session_before_compact` extension hook (tested against
 TypeScript extension directly.
 
 ```bash
-pi install npm:pi-cache-compact
+pi install npm:pi-cache-compact-preserved-messages
 # or from a checkout, without installing anything
 pi -e ./src/extension.ts
 ```
@@ -81,7 +81,8 @@ Options are read from JSON, merged with the project file winning:
 
 ```json
 {
-  "models": ["local/qwen3-coder"]
+  "models": ["local/qwen3-coder"],
+  "preserveDialogue": true
 }
 ```
 
@@ -90,7 +91,8 @@ Options are read from JSON, merged with the project file winning:
 | `enabled` | boolean | `true` | Disable the extension entirely. |
 | `models` | string[] | `[]` (all) | Only act on these `provider/modelId`s. Scope it to your local endpoint. |
 | `summaryModel` | `{ provider, id }` | active model | Summarize with a different (e.g. cheaper) model. |
-| `summaryPrompt` | string | [see `src/build.ts`](src/build.ts) | Replace the handoff instruction. |
+| `summaryPrompt` | string | [see `src/build.ts`](src/build.ts) | Replace the handoff instruction. In `preserveDialogue` mode a custom prompt is responsible for keeping the summary tool-only. |
+| `preserveDialogue` | boolean | `true` | Keep every historical user message and visible assistant text response verbatim in future model context. Old tool results and tool calls are replaced by the generated technical summary; old thinking/reasoning is discarded rather than summarized. |
 | `summaryMaxTokens` | number | derived | Cap on the summary's output tokens. By default it is **Pi's own ceiling** (`0.8 × reserveTokens`, clamped to the model's `maxTokens`) bounded by half of what this compaction drops, with a 2048 floor for thinking tokens — so a checkpoint is never larger than what it replaces. Set a number to override all of that. A reply truncated at the cap is rejected and Pi's default runs, so prefer a generous cap. |
 | `summaryReasoningEffort` | `"off" \| "none" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | mirror the live request | Force an effort. The default mirrors what the last live request actually sent, because the effort reaches the prompt on some servers (see Caveats). `"none"` sends `reasoning_effort: "none"`, which llama.cpp documents as disabling reasoning *without* handing the value to the chat template; `"off"` sends no field at all, leaving the server's default. Either is worth trying if a reasoning model keeps ending its turn inside its reasoning block. |
 | `cacheRetention` | `"none" \| "short" \| "long"` | `"short"` | Cache retention for the summary request. |
@@ -161,9 +163,47 @@ the conversation's system prompt, declares the same tools, and the previous live
 request is a **strict prefix** of it — the entire live prompt is reusable from
 cache, and only the ask is new.
 
+### Preserve dialogue verbatim
+
+By default, `preserveDialogue` is `true`, so a fresh install needs no extra config. Set it to `false` only to opt out. With preservation enabled, compaction has two separate responsibilities:
+
+1. The cache-friendly continuation asks the model for a **technical checkpoint
+   only**: tool calls/results, inspected repository/runtime state, edits,
+   commands, tests, errors, validation, and unresolved technical findings.
+   User messages and visible assistant prose are explicitly excluded from that
+   summary.
+2. A `context` hook rebuilds every later model request from Pi's append-only
+   raw session branch. All historical user messages and visible assistant text
+   blocks before the latest compaction cut are restored verbatim; old thinking,
+   tool-call blocks, and tool results stay removed. The technical checkpoint is
+   inserted once between that restored dialogue and Pi's retained recent tail.
+
+The compaction entry carries a versioned marker in `details`, so this behavior
+survives Pi restarts and repeated compactions. Append-only `context_edit`
+entries are honored when old dialogue is restored. This mode also fails closed:
+if a safe technical summary cannot be produced (for example the cache is gone,
+the reply is unusable, or only a disallowed rewind fits), the extension cancels
+that compaction instead of letting Pi replace the preserved dialogue with its
+normal lossy summary.
+
+This mode intentionally does **not** compress dialogue. If user prompts plus
+assistant prose alone grow close to the model's context limit, no tool-output
+compaction strategy can reclaim enough space; disable the mode or start a fresh
+session at that point.
+
+### Certification
+
+Run `npm run certify` to execute typecheck, the full unit suite, and the real-Pi
+end-to-end suite. The preserve-dialogue e2e test resumes one persisted session
+across multiple Pi processes and repeated compactions, then verifies exact
+user/assistant dialogue restoration, a single technical summary, strict
+cache-prefix continuation, and removal of tool traffic that is behind the
+compaction cut. The newest tool interaction may still remain in Pi's normal
+recent tail.
+
 ### What the summary contains
 
-The ask is **Pi's own compaction prompt, copied verbatim** from
+In the default mode, the ask is **Pi's own compaction prompt, copied verbatim** from
 `core/compaction/compaction.js` (currently v0.87.0) — the structured checkpoint
 with `## Goal`, `## Constraints & Preferences`, `## Progress`, `## Key
 Decisions`, `## Next Steps`, `## Critical Context`. Pi does not export those
@@ -190,10 +230,17 @@ characters.
 
 ## Caveats
 
-- The first request after any compaction still prefills
-  `[system][summary][kept…]`, since that becomes the new shared prefix. This
-  extension only removes the extra full re-read that Pi's default summary
-  performs.
+- The first request after any compaction still prefills a new shared prefix. In
+  the default mode that is `[system][summary][kept…]`; with
+  `preserveDialogue` it is
+  `[system][restored dialogue][tool summary][kept…]`. The extension removes
+  the extra cold re-read used to *generate* the summary, not this unavoidable
+  first request after the context shape changes.
+- `preserveDialogue` makes user/assistant prose grow monotonically. When that
+  preserved dialogue itself approaches the compaction threshold, repeated
+  compaction cannot create useful headroom. Preserve mode cancels compaction
+  rather than falling back to Pi's lossy summary, so a fresh session is the
+  escape hatch once preserved dialogue itself is too large.
 - How much context compaction reclaims is Pi's `keepRecentTokens` setting: it
   keeps that many recent tokens verbatim. If it is close to (or larger than)
   `contextWindow - reserveTokens`, Pi drops little and compaction barely helps —
@@ -208,9 +255,9 @@ characters.
   default runs, which is why the calibration is bounded and the reported part of
   every estimate is used verbatim.
 - Reasoning models occasionally end a turn *inside* their reasoning block, so the
-  reply arrives with no text at all. Two defences: the ask is Pi's own prompt,
-  which prescribes an exact section format (the cheapest anchor there is, and it
-  costs nothing — the ask is not part of the cached prefix), and an empty reply
+  reply arrives with no text at all. Two defences: the ask prescribes an exact
+  section format (the cheapest anchor there is, and it costs nothing — the ask
+  is not part of the cached prefix), and an empty reply
   gets one retry that asks for the summary's first heading explicitly. Pi does
   **not** disable thinking for compaction either; it sends the session's level,
   exactly like this extension.

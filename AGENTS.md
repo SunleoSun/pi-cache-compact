@@ -44,11 +44,11 @@ most of the substance.
 | A rewind is a deliberate opt-in (`rewindWhenNeeded`, `continuation: false`), never a silent fallback | A rewind never reused a cache in any measurement and costs the whole conversation as a cold prefill — worse than Pi's own small summary. Where only the rewind fits, leave the compaction to Pi (logged as "only the rewinding shape fits"). |
 | Fit estimates are calibrated against the server's reported prompt size | `bytes / 3` alone is ~3x high on blob-heavy transcripts: it refuses shapes that fit and makes the reclaimed-size ceiling inert. `tokenScale` derives one ratio per decision from a reported prompt and the same messages. |
 | A summary whose response read nothing from the cache disables the continuation for 15 minutes | `usage.cacheRead === 0` with a large prompt means the checkpoint is gone, and then the whole-conversation request is the expensive shape — Pi's small truncated prompt prefills in seconds. `deferAfterCacheMiss: false` opts out. |
-| The ask is Pi's compaction prompt, copied verbatim, and the artifact keeps Pi's shape | Vendored in `build.ts` with the source path and version. An existing summary uses Pi's update prompt; a split turn uses Pi's two-part `**Turn Context (split turn):**` shape; the summary ends with Pi's `<read-files>`/`<modified-files>` appendix and the result carries `details`. Do not invent a summary format: the summary is a Pi checkpoint, and whoever reads it next does not know which path wrote it. |
-| The summary *text* covers only the messages before `firstKeptEntryId` | Pi keeps `keepRecentTokens` verbatim, so a summary that also covers the tail describes it twice and grows the context. With the continuation shape the scope is enforced by the boundary note in the ask (`SummaryBoundary`), not by the message list. |
+| With `preserveDialogue: false`, the ask is Pi's compaction prompt; the default preserve mode uses a tool-only checkpoint | Pi's default prompts remain vendored in `build.ts`. Preserve-dialogue mode must never paraphrase user messages or visible assistant prose: raw dialogue is restored through the `context` hook, while the summary owns only compacted tool-derived state; old reasoning is discarded. Both modes keep the machine-computed `<read-files>`/`<modified-files>` appendix and versioned `details`. |
+| The summary *text* covers only the messages before `firstKeptEntryId` | Pi keeps `keepRecentTokens` verbatim, so a summary that also covers the tail describes it twice and grows the context. With the continuation shape the scope is enforced by the boundary note in the ask (`SummaryBoundary`), not by the message list. In `preserveDialogue` mode the summary is additionally restricted to tool-derived state; dialogue comes from the append-only raw branch. |
 | Do not pass `systemPrompt`/`tools` when the projection already has a leading system message | The provider would replay/concatenate the prompt twice and the prefix would break. See `hasLeadingSystemMessage` in `extension.ts`. |
-| Return `undefined` (not a partial summary) when the reply is truncated, aborted, a tool call, or empty **after one retry** | A bad summary must never become the new conversation prefix. Pi's default then runs. The one retry is for a reply that stopped with no text block (the answer never left the reasoning channel): other failures repeat deterministically, and a cache hit makes the retry cost seconds. |
-| Never throw out of the handler | Pi catches, but we want the default fallback, not an error surfaced to the user. |
+| Never accept a truncated, aborted, tool-calling, or empty summary **after one retry** | A bad summary must never become the new conversation prefix. Normal mode returns `undefined` so Pi's default runs; `preserveDialogue` returns `{ cancel: true }` so verbatim dialogue cannot be lost. The one retry is for a reply that stopped with no text block; other failures repeat deterministically. |
+| Never throw out of the handler | In normal mode Pi's fallback remains valid. In `preserveDialogue` mode a fallback would violate the verbatim-dialogue invariant, so cancel that compaction instead of silently delegating to Pi's lossy summary. |
 | Debug `onPayload` hook returns `undefined` and never throws | A returned value would replace the outgoing request payload; a throw would kill the summarization call. Fingerprint only. |
 | `src/build.ts` stays pure (type-only SDK imports) | Unit tests exercise it without booting Pi. Message conversion (`convertToLlm`) happens in `extension.ts`; `planSummaryRequest` takes already-converted messages. |
 | The request shape and the ask are decided once, by `planSummaryRequest` | The handler hashes the ask to tag in-flight requests, and the fallback tag must match the ask that is actually sent. Two places computing the ask drifted apart once already. |
@@ -68,9 +68,10 @@ test/              # build, config, debug, extension (mock ctx), e2e (real Pi + 
 
 ```bash
 npm install
-npm run typecheck   # tsc --noEmit
-npm test            # unit tests (node --test)
-npm run test:e2e    # real `pi --print` + mock model server (opt-in)
+npm run typecheck # tsc --noEmit
+npm test # unit tests (node --test)
+npm run test:e2e # real `pi --print` + mock model server (opt-in)
+npm run certify # typecheck + unit suite + real-Pi e2e certification
 ```
 
 Node 24+ — the repo runs TypeScript directly and uses `node --test`.
@@ -81,12 +82,16 @@ Node 24+ — the repo runs TypeScript directly and uses `node --test`.
   handler's fallbacks with a mock context. Any change to the request shape, the
   fallback rules, or the options needs a matching test.
 - **End-to-end** (`npm run test:e2e`) is the one that catches real Pi behaviour:
-  it spawns `pi --print` with the extension loaded from source and a mock
-  OpenAI-compatible server that records HTTP bodies, then asserts the summary
-  request keeps the system prompt and tools, starts with the previous request's
-  exact prefix, and is the summary Pi persists. Run it after touching the
-  entry point, the hook, or the request assembly. It caught the doubled system
-  prompt bug.
+it spawns `pi --print` with the extension loaded from source and a mock
+OpenAI-compatible server that records HTTP bodies. Besides the cache-prefix
+contract, the preserve-dialogue certification runs multiple real Pi processes
+against one resumed session and proves repeated compaction restores old user
+prompts and visible assistant prose verbatim while compacted tool traffic stays
+out. Run it after touching the entry point, hooks, restore logic, or request
+assembly.
+- **Certification** (`npm run certify`) is the release-grade local proof:
+typecheck + the complete unit suite + the real-Pi e2e suite. It needs no
+network and no credentials.
 
 ## Releasing
 

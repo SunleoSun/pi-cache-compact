@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url"
 
 import { sharedPrefixLength } from "../src/debug.ts"
 
-const enabled = process.env.PI_CACHE_COMPACT_E2E === "1"
+const enabled = process.env.PI_CACHE_COMPACT_E2E === "1" || process.env.npm_lifecycle_event === "test:e2e"
 const here = path.dirname(fileURLToPath(import.meta.url))
 const extensionPath = path.resolve(here, "../src/extension.ts")
 
@@ -85,10 +85,13 @@ function startMockModel() {
       const model = body.model ?? "test-model"
       const last = lastMessage(body)
       const lastText = textOf(last?.content)
-      const isSummary =
-        last?.role === "user" && /(handoff|context checkpoint) summary/i.test(lastText)
-      const wantsTool =
-        last?.role === "user" && lastText.includes(MARKER) && toolCalls === 0 && Array.isArray(body.tools)
+    const isSummary =
+      last?.role === "user" &&
+      (/(handoff|context checkpoint) summary/i.test(lastText) ||
+        (/technical checkpoint ONLY from tool activity/i.test(lastText) || /technical tool-context checkpoint/i.test(lastText)))
+const wantsTool =
+!isSummary && last?.role === "user" && lastText.includes(MARKER) && Array.isArray(body.tools)
+const toolCallId = `call_${toolCalls + 1}`
 
       const sse = (payload: unknown) => `data: ${JSON.stringify(payload)}\n\n`
       const chunk = (choices: any[], extra: any = {}) => ({
@@ -109,7 +112,7 @@ function startMockModel() {
                 role: "assistant",
                 content: null,
                 tool_calls: [
-                  { id: "call_1", type: "function", function: { name: "read", arguments: '{"path":"probe.txt"}' } },
+                  { id: toolCallId, type: "function", function: { name: "read", arguments: '{"path":"probe.txt"}' } },
                 ],
               }
             : { role: "assistant", content: "done" }
@@ -148,7 +151,7 @@ function startMockModel() {
                 delta: {
                   role: "assistant",
                   tool_calls: [
-                    { index: 0, id: "call_1", type: "function", function: { name: "read", arguments: "" } },
+                    { index: 0, id: toolCallId, type: "function", function: { name: "read", arguments: "" } },
                   ],
                 },
                 finish_reason: null,
@@ -195,18 +198,30 @@ function startMockModel() {
 
 function runPi(
   mock: { baseURL: string },
-  options: { debugFile?: string; thinking?: string } = {},
-): Promise<{ code: number | null; stdout: string; stderr: string; agentDir: string; cleanup: () => void }> {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-e2e-"))
+options: {
+debugFile?: string
+thinking?: string
+preserveDialogue?: boolean
+root?: string
+prompt?: string
+probeContent?: string
+} = {},
+): Promise<{ code: number | null; stdout: string; stderr: string; agentDir: string; root: string; cleanup: () => void }> {
+const root = options.root ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-e2e-"))
   const project = path.join(root, "project")
   const agentDir = path.join(root, "agent")
   fs.mkdirSync(project, { recursive: true })
   fs.mkdirSync(agentDir, { recursive: true })
-  fs.writeFileSync(path.join(project, "probe.txt"), "hello probe\n")
+fs.writeFileSync(path.join(project, "probe.txt"), options.probeContent ?? "hello probe\n")
   if (options.debugFile) {
     fs.writeFileSync(
       path.join(agentDir, "cache-compact.json"),
-      JSON.stringify({ debug: true, debugFile: options.debugFile, debugPayloads: true }),
+      JSON.stringify({
+        debug: true,
+        debugFile: options.debugFile,
+        debugPayloads: true,
+        ...(options.preserveDialogue !== undefined ? { preserveDialogue: options.preserveDialogue } : undefined),
+      }),
     )
   }
 
@@ -239,16 +254,17 @@ function runPi(
     }),
   )
 
-  const args = [
-    cliPath,
-    "--print",
-    `${MARKER} list the files in the working directory`,
-    "--model",
-    "mock/test-model",
-    ...(options.thinking ? ["--thinking", options.thinking] : []),
-    "--extension",
-    extensionPath,
-  ]
+const args = [
+cliPath,
+"--print",
+...(options.root ? [["--", "continue"].join("")] : []),
+options.prompt ?? `${MARKER} list the files in the working directory`,
+"--model",
+"mock/test-model",
+...(options.thinking ? ["--thinking", options.thinking] : []),
+"--extension",
+extensionPath,
+]
   const env = {
     ...process.env,
     PI_CODING_AGENT_DIR: agentDir,
@@ -277,7 +293,8 @@ function runPi(
         code,
         stdout,
         stderr,
-        agentDir,
+agentDir,
+root,
         cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
       })
     })
@@ -303,7 +320,7 @@ test(
     const debugFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-debug-")), "debug.jsonl")
     let run: Awaited<ReturnType<typeof runPi>> | undefined
     try {
-      run = await runPi(mock, { debugFile, thinking: "low" })
+run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: false })
       const context = `pi exited with ${run.code}\n--- stderr ---\n${run.stderr}\n--- requests ---\n${dump(mock.requests)}`
 
       const summaryReq = mock.requests.find(
@@ -479,7 +496,7 @@ test(
       assert.ok(dumpVariants.has("live_before"), `no live_before dump; got ${[...dumpVariants]}`)
       assert.ok(dumpVariants.has("summarization"), `no summarization dump; got ${[...dumpVariants]}`)
       const dumpFile = path.join(path.dirname(debugFile), "dump-out.txt")
-      const script = new URL("../scripts/compare-dumps.mjs", import.meta.url).pathname
+      const script = fileURLToPath(new URL("../scripts/compare-dumps.mjs", import.meta.url))
       const { execFileSync } = await import("node:child_process")
       try {
         fs.writeFileSync(dumpFile, execFileSync("node", [script, debugFile], { encoding: "utf8" }))
@@ -498,4 +515,125 @@ test(
       run?.cleanup()
     }
   },
+)
+
+test(
+"certification: preserveDialogue keeps dialogue verbatim across restart and repeated compaction",
+{ skip: enabled ? false : "set PI_CACHE_COMPACT_E2E=1 to run (spawns pi)", timeout: 180_000 },
+async () => {
+const mock = await startMockModel()
+const debugFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-preserve-")), "debug.jsonl")
+const firstPrompt = `${MARKER} FIRST USER REQUIREMENT: preserve this exact text`
+const secondPrompt = `${MARKER} SECOND USER REQUIREMENT: preserve this exact text`
+const finalPrompt = "CERTIFICATION FINAL PROBE"
+let run: Awaited<ReturnType<typeof runPi>> | undefined
+try {
+run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: true, prompt: firstPrompt, probeContent: "FIRST TOOL OUTPUT\\n" })
+const root = run.root
+run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: true, root, prompt: secondPrompt, probeContent: "SECOND TOOL OUTPUT\\n" })
+run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: true, root, prompt: finalPrompt })
+
+const context = `pi exited with ${run.code}\n--- stderr ---\n${run.stderr}\n--- requests ---\n${dump(mock.requests)}`
+const isToolSummaryRequest = (request: Recorded | undefined): boolean =>
+Boolean(
+request &&
+(/technical checkpoint ONLY from tool activity/i.test(
+textOf(lastMessage(request.body)?.content),
+) ||
+/technical tool-context checkpoint/i.test(
+textOf(lastMessage(request.body)?.content),
+)),
+)
+const summaryIndexes = mock.requests
+.map((request, index) =>
+isToolSummaryRequest(request) && !isToolSummaryRequest(mock.requests[index - 1])
+? index
+: -1,
+)
+.filter((index) => index >= 0)
+assert.ok(
+summaryIndexes.length >= 2,
+`expected at least two preserve-dialogue compactions, got ${summaryIndexes.length}\n${context}`,
+)
+
+for (const summaryIndex of summaryIndexes.slice(0, 2)) {
+const summaryReq = mock.requests[summaryIndex]
+const previous = mock.requests[summaryIndex - 1]
+assert.ok(previous, `no live request before summary #${summaryIndex}\n${context}`)
+assert.deepEqual(
+previous.body.messages,
+summaryReq.body.messages.slice(0, previous.body.messages.length),
+`summary #${summaryIndex} is not a strict continuation of the cached live prefix\n${context}`,
+)
+assert.deepEqual(
+previous.body.tools,
+summaryReq.body.tools,
+`summary #${summaryIndex} changed the tool declarations\n${context}`,
+)
+assert.equal(
+summaryReq.body.reasoning_effort,
+previous.body.reasoning_effort,
+`summary #${summaryIndex} changed reasoning_effort\n${context}`,
+)
+}
+
+const finalLive = [...mock.requests]
+.reverse()
+.find(
+(request) =>
+lastMessage(request.body)?.role === "user" &&
+textOf(lastMessage(request.body)?.content) === finalPrompt,
+)
+assert.ok(finalLive, `no live request for the final certification probe\n${context}`)
+
+const messages = finalLive.body.messages ?? []
+const userTexts = messages
+.filter((message: any) => message.role === "user")
+.map((message: any) => textOf(message.content))
+const assistantTexts = messages
+.filter((message: any) => message.role === "assistant")
+.map((message: any) => textOf(message.content))
+.filter(Boolean)
+assert.equal(
+userTexts.filter((text: string) => text === firstPrompt).length,
+1,
+`first user prompt was not preserved exactly once\n${context}`,
+)
+assert.equal(
+userTexts.filter((text: string) => text === secondPrompt).length,
+1,
+`second user prompt was not preserved exactly once\n${context}`,
+)
+assert.equal(
+assistantTexts.filter((text: string) => text === "done").length,
+2,
+`visible assistant replies were not preserved verbatim across both compactions\n${context}`,
+)
+
+const rendered = JSON.stringify(messages)
+assert.equal(
+rendered.split(SUMMARY_TEXT).length - 1,
+1,
+`technical summary must appear exactly once in the final model context\n${context}`,
+)
+assert.ok(!rendered.includes("FIRST TOOL OUTPUT"), `compacted tool output leaked back into model context\n${context}`)
+assert.ok(!rendered.includes("call_1"), `compacted tool call leaked back into model context\n${context}`)
+// The newest tool interaction may legitimately remain in Pi's retained tail.
+
+const sessionText = fs
+.readdirSync(run.agentDir, { recursive: true })
+.filter((file) => String(file).endsWith(".jsonl"))
+.map((file) => fs.readFileSync(path.join(run!.agentDir, String(file)), "utf8"))
+.join("\n")
+assert.ok(sessionText.includes(firstPrompt), "raw session lost the first user prompt")
+assert.ok(sessionText.includes(secondPrompt), "raw session lost the second user prompt")
+assert.ok(
+(sessionText.match(/"mode":"preserve-dialogue-v1"/g) ?? []).length >= 2,
+"repeated compactions did not persist preserve-dialogue markers",
+)
+} finally {
+mock.close()
+run?.cleanup()
+}
+},
 )

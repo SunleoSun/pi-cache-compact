@@ -93,6 +93,7 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`
 
+
 export const PI_TURN_PREFIX_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
 Summarize the prefix to provide context for the retained suffix:
@@ -130,9 +131,58 @@ export const PI_TURN_PREFIX_FORMAT = `## Original Request
 export const PI_SPLIT_MARKER = "**Turn Context (split turn):**"
 export const PI_NO_HISTORY = "No prior history."
 
+export const PRESERVE_TOOL_SUMMARY_PROMPT = `Create a compact technical checkpoint ONLY from tool activity, tool results, and tool-derived operational state in the scoped conversation.
+
+The original user messages and visible assistant responses are preserved verbatim elsewhere and will be reinserted into the model context. Do NOT summarize, paraphrase, restate, reinterpret, or quote them.
+
+Assistant thinking/reasoning is intentionally discarded. Do NOT preserve it or promote claims that appear only in thinking. Include a fact only when it is evidenced by tool activity/results or by repository/runtime state observed through tools.
+
+Capture only durable technical state learned or produced through tool activity:
+- files, symbols, APIs, schemas, and repository/runtime state that were inspected;
+- edits or writes that were actually made;
+- commands, tests, compiler/linter results, exact errors, and validation evidence;
+- technical findings and unresolved implementation state evidenced by tools;
+- exact file paths, identifiers, commands, and error text when they matter.
+
+Use this format:
+
+## Tool Context
+### Inspected State
+- [durable facts learned from tools, or "(none)"]
+
+### Changes & Validation
+- [changes made and their observed validation, or "(none)"]
+
+### Unresolved Technical State
+- [open tool-evidenced findings/blockers, or "(none)"]
+
+Keep it compact and factual. Do not turn user requirements, assistant prose, or assistant reasoning into summary content.`
+
+export const PRESERVE_TOOL_UPDATE_PROMPT = `Update the existing technical tool-context checkpoint using only new tool activity, tool results, and tool-derived operational state in the scoped conversation.
+
+The original user messages and visible assistant responses are preserved verbatim elsewhere. Do NOT summarize, paraphrase, restate, reinterpret, or quote them.
+
+Assistant thinking/reasoning is intentionally discarded. Do NOT preserve it or promote claims that appear only in thinking. Preserve still-current tool-evidenced facts from the prior checkpoint, add new tool-derived facts, update changed repository/runtime state, and remove only technical facts that new tool evidence makes obsolete.
+
+Use this format:
+
+## Tool Context
+### Inspected State
+- [durable facts learned from tools, or "(none)"]
+
+### Changes & Validation
+- [changes made and their observed validation, or "(none)"]
+
+### Unresolved Technical State
+- [open tool-evidenced findings/blockers, or "(none)"]
+
+Keep it compact and factual. Preserve exact file paths, identifiers, commands, and error text when they matter.`
+
 export type SummaryPromptOptions = {
-  /** Replace Pi's handoff instruction. */
-  summaryPrompt?: string
+/** Replace the default handoff instruction. */
+summaryPrompt?: string
+/** Summarize only tool-derived state; dialogue is restored verbatim and reasoning is discarded. */
+preserveDialogue?: boolean
 }
 
 /**
@@ -183,7 +233,13 @@ export type SummaryAskArgs = SummaryPromptOptions & {
 export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
   const base =
     args.summaryPrompt?.trim() ||
-    (args.previous ? PI_UPDATE_SUMMARY_PROMPT : PI_SUMMARY_PROMPT)
+    (args.preserveDialogue
+      ? args.previous
+        ? PRESERVE_TOOL_UPDATE_PROMPT
+        : PRESERVE_TOOL_SUMMARY_PROMPT
+      : args.previous
+        ? PI_UPDATE_SUMMARY_PROMPT
+        : PI_SUMMARY_PROMPT)
   const parts = [
     base,
     // Pi's prompt does not say this (Pi declares no tools at all, so its model
@@ -199,7 +255,7 @@ export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
   const scope = (boundary: SummaryBoundary, closing: string): string =>
     `Cover the conversation only up to and including the ${boundary.role} message that begins:\n\n"${boundary.snippet}"\n\n${closing}`
 
-  if (args.split) {
+  if (args.split && !args.preserveDialogue) {
     if (args.boundary) {
       parts.push(scope(args.boundary, "Do not cover anything after that point here."))
     }
@@ -335,23 +391,28 @@ export function planSummaryRequest(args: {
       messages,
       scale,
       ask: renderSummaryAsk({
-        summaryPrompt: args.options.summaryPrompt,
-        previous: Boolean(args.previousSummary),
-        focus: args.customInstructions,
-      }),
+      summaryPrompt: args.options.summaryPrompt,
+      preserveDialogue: args.options.preserveDialogue,
+      previous: Boolean(args.previousSummary),
+      focus: args.customInstructions,
+    }),
     })
 
   const droppedCount = args.droppedMessages.length
+  const keptCount = args.keptCount ?? args.liveMessages.length - droppedCount
+  // The last live provider request is usable only if its prefix reaches the
+  // actual compacted boundary in the model-visible context. Comparing only
+  // with `droppedCount` is insufficient when preserveDialogue has restored
+  // older dialogue before Pi's native projected prefix.
+  const requiredRequestCount = Math.max(0, args.liveMessages.length - keptCount)
   const candidates: { shape: SummaryRequestShape; messages: Message[] }[] = []
   if (args.options.continuation !== false) {
     if (args.liveMessages.length > droppedCount) {
       candidates.push({ shape: "continuation", messages: args.liveMessages })
     }
-    // `>=`, not `>`: when the dropped span *is* the last live request (a tiny
-    // session, or one where nothing was kept) those bytes are still a forward
-    // continuation — labelling them "dropped" would report a rewinding shape
-    // for a request that the server served from cache.
-    if (args.requestMessages.length >= droppedCount && args.requestMessages.length > 0) {
+    // `>=`, not `>`: when the compacted boundary is exactly the end of the
+    // last live request those bytes are still a forward continuation.
+    if (args.requestMessages.length >= requiredRequestCount && args.requestMessages.length > 0) {
       candidates.push({ shape: "continuation-request", messages: args.requestMessages })
     }
   }
@@ -378,7 +439,6 @@ export function planSummaryRequest(args: {
   // The scope note only matters when the request also carries messages the
   // model may not summarize: nothing is retained when the shape is `dropped`
   // (a rewind) or when the conversation kept no tail at all.
-  const keptCount = args.keptCount ?? chosen.messages.length - droppedCount
   const boundary = chosen.shape !== "dropped" && keptCount > 0 ? boundaryFor(args.droppedMessages) : undefined
 
   let split: SummaryRequestPlan["split"]
@@ -386,7 +446,7 @@ export function planSummaryRequest(args: {
   if (turnPrefixCount > 0 && turnPrefixCount <= droppedCount) {
     const history = args.droppedMessages.slice(0, droppedCount - turnPrefixCount)
     const prefixBoundary = boundaryFor(args.droppedMessages)
-    if (prefixBoundary) {
+    if (prefixBoundary && args.options.preserveDialogue !== true) {
       split = {
         boundary: prefixBoundary,
         hasHistory: history.length > 0 || Boolean(args.previousSummary),
@@ -401,6 +461,7 @@ export function planSummaryRequest(args: {
     rewindFallback,
     ask: renderSummaryAsk({
       summaryPrompt: args.options.summaryPrompt,
+      preserveDialogue: args.options.preserveDialogue,
       previous: Boolean(args.previousSummary),
       focus: args.customInstructions,
       ...(boundary ? { boundary } : undefined),

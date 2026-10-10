@@ -52,6 +52,22 @@ test("renderSummaryAsk falls back to the default prompt and appends custom instr
   )
 })
 
+test("renderSummaryAsk has a tool-only mode that never asks to summarize preserved dialogue", () => {
+  const first = renderSummaryAsk({ preserveDialogue: true })
+  assert.match(first, /technical checkpoint ONLY from tool activity/i)
+assert.match(first, /Do NOT summarize, paraphrase, restate, reinterpret, or quote them/)
+assert.match(first, /thinking\/reasoning is intentionally discarded/i)
+assert.match(first, /claims that appear only in thinking/i)
+assert.doesNotMatch(first, /assistant reasoning\/tool-use state/i)
+assert.doesNotMatch(first, /^## Goal$/m)
+
+  const update = renderSummaryAsk({ preserveDialogue: true, previous: true })
+assert.match(update, /Update the existing technical tool-context checkpoint/)
+assert.match(update, /thinking\/reasoning is intentionally discarded/i)
+assert.doesNotMatch(update, /assistant reasoning\/tool-use state/i)
+assert.doesNotMatch(update, /PRESERVE all existing information from the previous summary/)
+})
+
 test("activeToolDeclarations keeps only active tools, in Pi's order", () => {
   const all = [
     { name: "read", description: "read a file", parameters: { type: "object" }, sourceInfo: {} },
@@ -303,6 +319,37 @@ test("planSummaryRequest picks the continuation and names the boundary", () => {
   })
   assert.equal(hopeless.shape, "continuation")
   assert.equal(hopeless.messages, liveMessages)
+})
+
+test("planSummaryRequest does not use a cached request that stops before a restored-dialogue boundary", () => {
+  const restoredDialogue = [
+    { role: "user", content: "old user 1" },
+    { role: "assistant", content: [{ type: "text", text: "old answer 1" }] },
+    { role: "user", content: "old user 2" },
+    { role: "assistant", content: [{ type: "text", text: "old answer 2" }] },
+  ] as any[]
+  const droppedMessages = [
+    { role: "compactionSummary", summary: "old tool state" },
+    { role: "assistant", content: [{ type: "text", text: "new tool-dependent work" }] },
+  ] as any[]
+  const kept = { role: "user", content: "recent kept tail" } as any
+  const liveMessages = [...restoredDialogue, ...droppedMessages, kept]
+  // Numerically this request is longer than droppedMessages, but it stops
+  // before the actual compacted boundary in liveMessages. The old length-only
+  // check would incorrectly select it and omit new technical state.
+  const requestMessages = liveMessages.slice(0, 5)
+
+  const plan = planSummaryRequest({
+    liveMessages,
+    requestMessages,
+    droppedMessages,
+    keptCount: 1,
+    options: { preserveDialogue: true },
+    contextWindow: 20,
+    maxTokens: 5,
+  })
+
+  assert.notEqual(plan.shape, "continuation-request")
 })
 
 test("planSummaryRequest continues the last live request when the projection is too big", () => {

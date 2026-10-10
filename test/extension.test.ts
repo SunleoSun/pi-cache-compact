@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 
 import type {
   ExtensionAPI,
@@ -40,6 +41,7 @@ function setup(config?: {
   systemPrompt?: string
   messages?: any[]
   entries?: any[]
+  branchEntries?: any[]
   // The summarizer's model shape is mirrored here; `contextWindow` drives the
   // continuation guard, so tests can make it too small to fit.
   model?: { provider: string; id: string; contextWindow?: number }
@@ -69,6 +71,7 @@ function setup(config?: {
     model: config?.model ?? { provider: "mock", id: "test-model" },
     getSystemPrompt: () => config?.systemPrompt ?? "SYSTEM PROMPT",
     sessionManager: {
+      getBranch: () => config?.branchEntries ?? [],
       buildSessionProjection: () => ({
         messages: config?.messages ?? [
           { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
@@ -132,13 +135,17 @@ function event(overrides: Partial<SessionBeforeCompactEvent> = {}): SessionBefor
 }
 
 function tempWorkspace(config?: unknown): { cwd: string; agentDir: string; cleanup: () => void } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-ext-"))
-  const cwd = path.join(root, "project")
-  const agentDir = path.join(root, "agent")
-  fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true })
-  fs.mkdirSync(agentDir, { recursive: true })
-  if (config) fs.writeFileSync(path.join(cwd, ".pi", "cache-compact.json"), JSON.stringify(config))
-  return { cwd, agentDir, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) }
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-ext-"))
+const cwd = path.join(root, "project")
+const agentDir = path.join(root, "agent")
+fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true })
+fs.mkdirSync(agentDir, { recursive: true })
+const effectiveConfig =
+config && typeof config === "object" && !Array.isArray(config)
+? { preserveDialogue: false, ...(config as Record<string, unknown>) }
+: { preserveDialogue: false }
+fs.writeFileSync(path.join(cwd, ".pi", "cache-compact.json"), JSON.stringify(effectiveConfig))
+return { cwd, agentDir, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) }
 }
 
 test("writes a summary as a forward continuation of the live conversation", async () => {
@@ -178,6 +185,214 @@ test("writes a summary as a forward continuation of the live conversation", asyn
     assert.match(askText, /"hi"/)
     assert.equal(options.toolChoice, "none")
     assert.equal(options.cacheRetention, "short")
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test("preserveDialogue writes a tool-only summary and persists a restoration marker", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const { handler, ctx, calls } = setup({ cwd: ws.cwd })
+    const result = (await handler(event(), ctx)) as any
+
+    const askText = calls.complete[0].context.messages.at(-1).content[0].text
+    assert.match(askText, /technical checkpoint ONLY from tool activity/i)
+assert.match(askText, /Do NOT summarize, paraphrase, restate, reinterpret, or quote them/)
+assert.match(askText, /thinking\/reasoning is intentionally discarded/i)
+assert.doesNotMatch(askText, /assistant reasoning\/tool-use state/i)
+assert.doesNotMatch(askText, /^## Goal$/m)
+    assert.deepEqual(result.compaction.details.cacheCompact, {
+      mode: "preserve-dialogue-v1",
+      version: 1,
+    })
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test("context hook restores old dialogue verbatim and keeps the technical summary once", async () => {
+  const ws = tempWorkspace()
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const branchEntries = [
+      {
+        type: "message",
+        id: "u-old",
+        parentId: null,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: { role: "user", content: "EXACT OLD PROMPT", timestamp: 1 },
+      },
+      {
+        type: "message",
+        id: "a-old",
+        parentId: "u-old",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        message: {
+          ...assistant([
+            { type: "thinking", thinking: "hidden" },
+            { type: "text", text: "EXACT OLD RESPONSE" },
+            { type: "toolCall", id: "tool-1", name: "read", arguments: { path: "x" } },
+          ] as any),
+        },
+      },
+      {
+        type: "message",
+        id: "keep-1",
+        parentId: "a-old",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        message: { role: "user", content: "RECENT PROMPT", timestamp: 3 },
+      },
+      {
+        type: "compaction",
+        id: "compact-1",
+        parentId: "keep-1",
+        timestamp: "2026-01-01T00:00:03.000Z",
+        summary: "## Tool Context\n- inspected x",
+        firstKeptEntryId: "keep-1",
+        tokensBefore: 1000,
+        details: { cacheCompact: { mode: "preserve-dialogue-v1", version: 1 } },
+      },
+    ]
+    const { ctx, handlers } = setup({ cwd: ws.cwd, branchEntries })
+    const contextHandler = handlers.get("context")!
+    const restored = await contextHandler(
+      {
+        type: "context",
+        messages: [
+          {
+            role: "compactionSummary",
+            summary: "## Tool Context\n- inspected x",
+            tokensBefore: 1000,
+            timestamp: 4,
+          },
+          { role: "user", content: "RECENT PROMPT", timestamp: 3 },
+        ],
+      },
+      ctx,
+    )
+
+    assert.deepEqual(restored.messages.map((message: any) => message.role), [
+      "user",
+      "assistant",
+      "compactionSummary",
+      "user",
+    ])
+    assert.equal(restored.messages[0].content, "EXACT OLD PROMPT")
+    assert.deepEqual(restored.messages[1].content, [{ type: "text", text: "EXACT OLD RESPONSE" }])
+    assert.equal(restored.messages.filter((message: any) => message.role === "compactionSummary").length, 1)
+    assert.ok(!JSON.stringify(restored.messages).includes("hidden"))
+    assert.ok(!JSON.stringify(restored.messages).includes("tool-1"))
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test("a later preserveDialogue compaction summarizes the same restored dialogue view sent live", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const oldSummary = {
+      role: "compactionSummary",
+      summary: "## Tool Context\nold tool state",
+      tokensBefore: 900,
+      timestamp: 3,
+    }
+    const keptOne = { role: "user", content: "KEPT ONE", timestamp: 4 }
+    const afterOne = assistant([{ type: "text", text: "AFTER ONE" }])
+    const keepTwo = { role: "user", content: "KEEP TWO", timestamp: 6 }
+    const branchEntries = [
+      {
+        type: "message",
+        id: "u-old",
+        parentId: null,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: { role: "user", content: "EXACT OLD PROMPT", timestamp: 1 },
+      },
+      {
+        type: "message",
+        id: "a-old",
+        parentId: "u-old",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        message: {
+          ...assistant([
+            { type: "text", text: "EXACT OLD RESPONSE" },
+            { type: "toolCall", id: "old-tool", name: "read", arguments: { path: "old.ts" } },
+          ] as any),
+        },
+      },
+      {
+        type: "message",
+        id: "keep-1",
+        parentId: "a-old",
+        timestamp: "2026-01-01T00:00:02.000Z",
+        message: keptOne,
+      },
+      {
+        type: "compaction",
+        id: "compact-1",
+        parentId: "keep-1",
+        timestamp: "2026-01-01T00:00:03.000Z",
+        summary: oldSummary.summary,
+        firstKeptEntryId: "keep-1",
+        tokensBefore: 900,
+        details: { cacheCompact: { mode: "preserve-dialogue-v1", version: 1 } },
+      },
+      {
+        type: "message",
+        id: "after-1",
+        parentId: "compact-1",
+        timestamp: "2026-01-01T00:00:04.000Z",
+        message: afterOne,
+      },
+      {
+        type: "message",
+        id: "keep-2",
+        parentId: "after-1",
+        timestamp: "2026-01-01T00:00:05.000Z",
+        message: keepTwo,
+      },
+    ]
+    const entries = [
+      { sourceEntry: { id: "compact-1" }, messages: [oldSummary] },
+      { sourceEntry: { id: "keep-1" }, messages: [keptOne] },
+      { sourceEntry: { id: "after-1" }, messages: [afterOne] },
+      { sourceEntry: { id: "keep-2" }, messages: [keepTwo] },
+    ]
+    const { handler, ctx, calls } = setup({
+      cwd: ws.cwd,
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+        oldSummary,
+        keptOne,
+        afterOne,
+        keepTwo,
+      ],
+      entries,
+    })
+
+    await handler(
+      event({
+        preparation: {
+          firstKeptEntryId: "keep-2",
+          tokensBefore: 1800,
+          previousSummary: oldSummary.summary,
+          turnPrefixMessages: [],
+          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+        } as any,
+        branchEntries: branchEntries as any,
+      }),
+      ctx,
+    )
+
+    const summaryContext = calls.complete[0].context.messages
+    const serialized = JSON.stringify(summaryContext)
+    assert.ok(serialized.includes("EXACT OLD PROMPT"))
+    assert.ok(serialized.includes("EXACT OLD RESPONSE"))
+    assert.ok(serialized.includes("old tool state"))
+    assert.ok(!serialized.includes("old-tool"))
+    assert.match(summaryContext.at(-1).content[0].text, /Update the existing technical tool-context checkpoint/)
   } finally {
     ws.cleanup()
   }
@@ -242,6 +457,32 @@ test("a continuation that would not fit defers to Pi instead of rewinding", asyn
   }
 })
 
+test("preserveDialogue cancels instead of falling back when only a rewind fits", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true, debug: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const huge = "x".repeat(200_000)
+    const { handler, ctx, calls } = setup({
+      cwd: ws.cwd,
+      model: { provider: "mock", id: "test-model", contextWindow: 32_000 },
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+        { role: "user", content: "hello from the session", timestamp: 1 },
+        { role: "user", content: huge, timestamp: 3 },
+      ],
+      entries: [
+        { sourceEntry: { id: "sys" }, messages: [{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 }] },
+        { sourceEntry: { id: "u1" }, messages: [{ role: "user", content: "hello from the session", timestamp: 1 }] },
+        { sourceEntry: { id: "keep-1" }, messages: [{ role: "user", content: huge, timestamp: 3 }] },
+      ],
+    })
+    assert.deepEqual(await handler(event(), ctx), { cancel: true })
+    assert.equal(calls.complete.length, 0)
+  } finally {
+    ws.cleanup()
+  }
+})
+
 test("rewindWhenNeeded: true sends the dropped span when nothing else fits", async () => {
   const ws = tempWorkspace({ rewindWhenNeeded: true })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
@@ -286,6 +527,36 @@ test("rejects unusable summaries and leaves compaction to Pi", async () => {
     } finally {
       ws.cleanup()
     }
+  }
+})
+
+test("preserveDialogue cancels when an unusable summary would otherwise fall back to Pi", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const { handler, ctx } = setup({
+      cwd: ws.cwd,
+      response: assistant([{ type: "text", text: "partial" }], "length"),
+    })
+    assert.deepEqual(await handler(event(), ctx), { cancel: true })
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test("preserveDialogue cancels when the summary request throws", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const { handler, ctx } = setup({
+      cwd: ws.cwd,
+      response: async () => {
+        throw new Error("connection refused")
+      },
+    })
+    assert.deepEqual(await handler(event(), ctx), { cancel: true })
+  } finally {
+    ws.cleanup()
   }
 })
 
@@ -572,7 +843,7 @@ test("debugPayloads dumps live_before, summarization, and live_after", async () 
 
     // The compare script runs against the dump and finds a shared prefix.
     const { execFileSync } = await import("node:child_process")
-    const script = new URL("../scripts/compare-dumps.mjs", import.meta.url).pathname
+    const script = fileURLToPath(new URL("../scripts/compare-dumps.mjs", import.meta.url))
     let out = ""
     try {
       out = execFileSync("node", [script, debugFile], { encoding: "utf8" })
@@ -861,6 +1132,23 @@ test("a continuation that missed the cache defers the next compaction to Pi", as
       readRecords(debugFile).some((r) => /missed the cache/.test(r.kind)),
       "no deferral record",
     )
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test("preserveDialogue cancels the next compaction after a large cache miss", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const { handler, ctx, calls } = setup({
+      cwd: ws.cwd,
+      response: async () => withUsage({ input: 100_000, output: 500, cacheRead: 0 }),
+    })
+    const first = (await handler(event(), ctx)) as any
+    assert.equal(first.compaction.details.cacheCompact.mode, "preserve-dialogue-v1")
+    assert.deepEqual(await handler(event(), ctx), { cancel: true })
+    assert.equal(calls.complete.length, 1, "a cold continuation was retried instead of cancelling")
   } finally {
     ws.cleanup()
   }

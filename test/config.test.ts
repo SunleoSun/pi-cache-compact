@@ -12,7 +12,8 @@ test("parseOptions keeps valid fields and drops unknown or wrongly typed ones", 
       enabled: false,
       models: ["mock/test-model", 42],
       summaryModel: { provider: "mock", id: "small" },
-      summaryPrompt: "  do it  ",
+      summaryPrompt: " do it ",
+      preserveDialogue: true,
       summaryMaxTokens: 512.9,
       summaryReasoningEffort: "minimal",
       cacheRetention: "long",
@@ -26,7 +27,8 @@ test("parseOptions keeps valid fields and drops unknown or wrongly typed ones", 
       enabled: false,
       models: ["mock/test-model"],
       summaryModel: { provider: "mock", id: "small" },
-      summaryPrompt: "  do it  ",
+      summaryPrompt: " do it ",
+      preserveDialogue: true,
       summaryMaxTokens: 512,
       summaryReasoningEffort: "minimal",
       cacheRetention: "long",
@@ -48,6 +50,8 @@ test("parseOptions rejects malformed values without throwing", () => {
   assert.deepEqual(parseOptions({ debugFile: "   " }), {})
   assert.deepEqual(parseOptions({ debugFile: 42 }), {})
   assert.deepEqual(parseOptions({ debugPayloads: "yes" }), {})
+  assert.deepEqual(parseOptions({ preserveDialogue: "yes" }), {})
+  assert.deepEqual(parseOptions({ preserveDialogue: false }), { preserveDialogue: false })
 })
 
 test("readOptions merges files in order with the later file winning", () => {
@@ -60,7 +64,8 @@ test("readOptions merges files in order with the later file winning", () => {
 
     const merged = readOptions([personal, path.join(dir, "missing.json"), project])
     assert.deepEqual(merged, {
-      summaryMaxTokens: 200,
+preserveDialogue: true,
+summaryMaxTokens: 200,
       summaryReasoningEffort: "low",
       debug: true,
       enabled: false,
@@ -99,13 +104,27 @@ test("a sparse project file cannot undo continuation from the personal file", ()
     fs.writeFileSync(personal, JSON.stringify({ continuation: false, rewindWhenNeeded: true }))
     fs.writeFileSync(project, JSON.stringify({ summaryMaxTokens: 200 }))
     assert.deepEqual(readOptions([personal, project]), {
-      continuation: false,
+preserveDialogue: true,
+continuation: false,
       rewindWhenNeeded: true,
       summaryMaxTokens: 200,
     })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("readOptions enables preserveDialogue by default and explicit false overrides it", () => {
+assert.deepEqual(readOptions([]), { preserveDialogue: true })
+
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-"))
+try {
+const file = path.join(dir, "cache-compact.json")
+fs.writeFileSync(file, JSON.stringify({ preserveDialogue: false }))
+assert.deepEqual(readOptions([file]), { preserveDialogue: false })
+} finally {
+fs.rmSync(dir, { recursive: true, force: true })
+}
 })
 
 test("summaryReasoningEffort accepts \"off\"", () => {

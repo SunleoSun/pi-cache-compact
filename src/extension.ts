@@ -27,6 +27,7 @@ import type {
   ExtensionContext,
   SessionBeforeCompactEvent,
   SessionBeforeCompactResult,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent"
 import type { AgentMessage } from "@earendil-works/pi-agent-core"
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai"
@@ -58,6 +59,11 @@ import {
   type CacheCompactOptions,
 } from "./config.ts"
 import { DebugLogger, fingerprintPayload, redactHeaders, shortHash, snapshot } from "./debug.ts"
+import {
+  PRESERVE_DIALOGUE_MARKER,
+  rebuildPreservedDialogue,
+  type CacheCompactDetails,
+} from "./preserve.ts"
 
 export type { CacheCompactOptions } from "./config.ts"
 
@@ -266,6 +272,21 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   // — far more so than Pi's little truncated prompt. See `deferAfterCacheMiss`.
   const lastSummaryOutcome = new Map<string, { at: number; missed: boolean }>()
 
+// A preserve-dialogue compaction hides old entries from Pi's normal
+// projection, but the raw branch is append-only. Rebuild the model view on
+// every live request so user prompts and visible assistant prose remain
+// verbatim while tool history stays compacted and old reasoning stays discarded.
+pi.on("context", (event, ctx) => {
+    try {
+      const messages = rebuildPreservedDialogue(event.messages, ctx.sessionManager.getBranch())
+      return messages ? { messages } : undefined
+    } catch {
+      // Context restoration must never break a request. Without a usable
+      // marker/boundary Pi's native compacted projection remains valid.
+      return undefined
+    }
+  })
+
   // Fingerprint every outgoing provider request — live turns and our own
   // summarization call alike. This is what makes cache divergence debuggable
   // after the fact: diff the `rolling` arrays of two records in the debug
@@ -370,6 +391,19 @@ export default function cacheCompact(pi: ExtensionAPI): void {
     if (!model) return
     if (!isModelAllowed(options.models, model.provider, model.id)) return
 
+    const preserveFallback = (
+      message: string,
+      data: Record<string, unknown>,
+    ): SessionBeforeCompactResult | undefined => {
+      if (options.preserveDialogue === true) {
+        dumpNextLive.delete(sessionId)
+        log.both(`${message}; cancelling compaction to preserve dialogue`, data)
+        return { cancel: true }
+      }
+      log.both(`${message}; leaving compaction to Pi`, data)
+      return undefined
+    }
+
     const summarizer = resolveSummarizer(ctx, options, model)
 
     // A previous continuation that read nothing from cache means the checkpoint
@@ -381,12 +415,11 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       prior?.missed === true &&
       Date.now() - prior.at < DEFER_AFTER_MISS_MS
     ) {
-      log.both("previous continuation missed the cache; leaving compaction to Pi", {
+      return preserveFallback("previous continuation missed the cache", {
         sessionId,
         missedAt: new Date(prior.at).toISOString(),
         tokensBefore: event.preparation.tokensBefore,
       })
-      return
     }
 
     // Plan the request once, here, so the `before_provider_request` fallback
@@ -402,7 +435,17 @@ export default function cacheCompact(pi: ExtensionAPI): void {
     // the exact prompt the server has cached. Falls back to the whole
     // projection when no request has been observed yet, or after a compaction
     // shortened the projection under the recorded count.
-    const liveMessages = convertToLlm(projection.messages as AgentMessage[])
+    const projectedAgent = projection.messages as AgentMessage[]
+    let systemCount = 0
+    while (projectedAgent[systemCount]?.role === "system") systemCount += 1
+    const rebuiltConversation = rebuildPreservedDialogue(
+      projectedAgent.slice(systemCount),
+      event.branchEntries as SessionEntry[],
+    )
+    const effectiveAgent = rebuiltConversation
+      ? [...projectedAgent.slice(0, systemCount), ...rebuiltConversation]
+      : projectedAgent
+    const liveMessages = convertToLlm(effectiveAgent)
     const observedCount = liveRequestCounts.get(sessionId)
     const requestMessages =
       observedCount !== undefined && observedCount > 0 && observedCount < liveMessages.length
@@ -432,11 +475,10 @@ export default function cacheCompact(pi: ExtensionAPI): void {
     // the whole conversation as a cold prefill — more than Pi's own small
     // summary, which is why it is now a deliberate opt-in.
     if (plan.rewindFallback && options.rewindWhenNeeded !== true) {
-      log.both("only the rewinding shape fits; leaving compaction to Pi", {
+      return preserveFallback("only the rewinding shape fits", {
         sessionId,
         tokensBefore: event.preparation.tokensBefore,
       })
-      return
     }
     const askHash = shortHash(plan.ask)
 
@@ -630,20 +672,26 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       }
       if (rejection) {
         recordCacheOutcome(response.usage)
-        log.both("summary rejected; leaving compaction to Pi", {
-          sessionId,
-          reason: rejection,
-          stopReason: response.stopReason,
-          usage: response.usage,
-          blocks: describeContent(response.content, options.debugPayloads === true),
-        })
-        return
-      }
-      // Pi appends a machine-computed file list to every summary; the model's
+    return preserveFallback("summary rejected", {
+      sessionId,
+      reason: rejection,
+      stopReason: response.stopReason,
+      usage: response.usage,
+      blocks: describeContent(response.content, options.debugPayloads === true),
+    })
+    }
+    // Pi appends a machine-computed file list to every summary; the model's
       // text is only the prose part. Mirroring it keeps summaries identical in
       // shape whichever path produced them.
-      const { readFiles, modifiedFiles } = computeFileLists(event.preparation.fileOps)
-      const summary = extractSummaryText(response.content) + formatFileOperations(readFiles, modifiedFiles)
+    const { readFiles, modifiedFiles } = computeFileLists(event.preparation.fileOps)
+    const summary = extractSummaryText(response.content) + formatFileOperations(readFiles, modifiedFiles)
+    const details: CacheCompactDetails = {
+      readFiles,
+      modifiedFiles,
+      ...(options.preserveDialogue === true
+        ? { cacheCompact: PRESERVE_DIALOGUE_MARKER }
+        : undefined),
+    }
       recordCacheOutcome(response.usage)
       log.both("wrote cache-friendly summary", {
         sessionId,
@@ -670,15 +718,14 @@ export default function cacheCompact(pi: ExtensionAPI): void {
           firstKeptEntryId: event.preparation.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
           usage: response.usage,
-          details: { readFiles, modifiedFiles },
+          details,
         },
       }
     } catch (error) {
-      log.both("summary request failed; leaving compaction to Pi", {
+      return preserveFallback("summary request failed", {
         sessionId,
         error: String(error),
       })
-      return
     }
   })
 }

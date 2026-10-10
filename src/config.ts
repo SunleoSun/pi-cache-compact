@@ -32,6 +32,12 @@ export interface CacheCompactOptions {
   summaryModel?: { provider: string; id: string }
   /** Replace the default handoff instruction. */
   summaryPrompt?: string
+/**
+* Keep historical user messages and visible assistant text verbatim in
+* future model context. Compaction summarizes only removed tool-derived
+* state; assistant reasoning is discarded. Default true.
+*/
+preserveDialogue?: boolean
   /**
    * Cap on the summary's output tokens. Default 8192. Must fit the whole
    * reply: on reasoning models the thinking tokens count against this cap,
@@ -196,6 +202,7 @@ export function parseOptions(raw: unknown): CacheCompactOptions {
   if (typeof raw.summaryPrompt === "string" && raw.summaryPrompt.trim()) {
     options.summaryPrompt = raw.summaryPrompt
   }
+if (typeof raw.preserveDialogue === "boolean") options.preserveDialogue = raw.preserveDialogue
   const maxTokens = positiveInt(raw.summaryMaxTokens)
   if (maxTokens) options.summaryMaxTokens = maxTokens
   const effort = reasoningEffort(raw.summaryReasoningEffort)
@@ -221,7 +228,7 @@ export function parseOptions(raw: unknown): CacheCompactOptions {
  * file cannot undo `enabled: false` (or `debugFile`) from the personal file.
  */
 export function readOptions(paths: readonly string[]): CacheCompactOptions {
-  const merged: CacheCompactOptions = {}
+  const merged: CacheCompactOptions = { preserveDialogue: true }
   for (const path of paths) {
     if (!existsSync(path)) continue
     let parsed: unknown
