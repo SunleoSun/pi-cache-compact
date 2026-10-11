@@ -16,6 +16,8 @@ import cacheCompact from "../src/extension.ts"
 
 type Calls = {
   complete: Array<{ model: any; context: any; options: any }>
+  compact: any[]
+  notifications: Array<{ message: string; type: string | undefined }>
 }
 
 function assistant(
@@ -46,11 +48,13 @@ function setup(config?: {
   // continuation guard, so tests can make it too small to fit.
   model?: { provider: string; id: string; contextWindow?: number }
   foundModel?: any
+  contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null }
+  hasUI?: boolean
   cwd?: string
   agentDir?: string
 }) {
   const handlers = new Map<string, Function>()
-  const calls: Calls = { complete: [] }
+  const calls: Calls = { complete: [], compact: [], notifications: [] }
   const api = {
     on: (event: string, handler: Function) => {
       handlers.set(event, handler)
@@ -68,6 +72,12 @@ function setup(config?: {
 
   const ctx = {
     cwd: config?.cwd ?? process.cwd(),
+    hasUI: config?.hasUI ?? false,
+    ui: {
+      notify: (message: string, type?: string) => {
+        calls.notifications.push({ message, type })
+      },
+    },
     model: config?.model ?? { provider: "mock", id: "test-model" },
     getSystemPrompt: () => config?.systemPrompt ?? "SYSTEM PROMPT",
     sessionManager: {
@@ -90,7 +100,11 @@ function setup(config?: {
       }),
       getSessionId: () => "sess-1",
     },
-    modelRegistry: {
+    getContextUsage: () => config?.contextUsage,
+compact: (options: any) => {
+  calls.compact.push(options)
+},
+modelRegistry: {
       find: () => config?.foundModel,
       complete: async (model: any, context: any, options: any) => {
         calls.complete.push({ model, context, options })
@@ -190,6 +204,233 @@ test("writes a summary as a forward continuation of the live conversation", asyn
   }
 })
 
+test("preserveDialogue proactively compacts at 90% between tool turns without aborting the agent run", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const branchEntries = [
+      {
+        type: "message",
+        id: "u1",
+        message: { role: "user", content: "PERMANENT USER REQUIREMENT", timestamp: 1 },
+      },
+      {
+        type: "message",
+        id: "a1",
+        message: {
+          ...assistant([
+            { type: "thinking", thinking: "compressible reasoning" },
+            { type: "text", text: "PERMANENT VISIBLE ANSWER" },
+            { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+          ] as any),
+        },
+      },
+      {
+        type: "message",
+        id: "t1",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-1",
+          toolName: "read",
+          content: [{ type: "text", text: "compressible tool output".repeat(500) }],
+          isError: false,
+          timestamp: 3,
+        },
+      },
+    ]
+    const messages = [
+      { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+      branchEntries[0].message,
+      branchEntries[1].message,
+      branchEntries[2].message,
+    ]
+    const { handlers, ctx, calls } = setup({
+      cwd: ws.cwd,
+      branchEntries,
+      messages,
+      contextUsage: { tokens: 92_000, contextWindow: 100_000, percent: 92 },
+      model: { provider: "mock", id: "test-model", contextWindow: 100_000 },
+    })
+
+    const result = await handlers.get("turn_end")!(
+      {
+        type: "turn_end",
+        turnIndex: 0,
+        message: branchEntries[1].message,
+        toolResults: [branchEntries[2].message],
+        messageEntryId: "a1",
+        toolResultEntryIds: ["t1"],
+        entries: [],
+        continue: false,
+      },
+      ctx,
+    )
+
+    assert.equal(calls.compact.length, 0, "dynamic compaction must not call ctx.compact() and abort the run")
+    assert.equal(calls.complete.length, 1)
+    assert.equal(result.entries.at(-1).type, "compaction")
+    assert.equal(result.entries.at(-1).firstKeptEntryId, null)
+    assert.match(JSON.stringify(calls.complete[0].context.messages), /compressible tool output/)
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test("preserveDialogue never proactively compacts a tool-free final turn", async () => {
+const ws = tempWorkspace({ preserveDialogue: true })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const assistantMessage = assistant([
+{ type: "thinking", thinking: "compressible reasoning".repeat(500) },
+{ type: "text", text: "PERMANENT VISIBLE ANSWER" },
+] as any)
+const branchEntries = [
+{ type: "message", id: "u1", message: { role: "user", content: "PERMANENT USER REQUIREMENT", timestamp: 1 } },
+{ type: "message", id: "a1", message: assistantMessage },
+]
+const { handlers, ctx, calls } = setup({
+cwd: ws.cwd,
+branchEntries,
+messages: [
+{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+branchEntries[0].message,
+branchEntries[1].message,
+],
+contextUsage: { tokens: 92_000, contextWindow: 100_000, percent: 92 },
+model: { provider: "mock", id: "test-model", contextWindow: 100_000 },
+})
+
+const result = await handlers.get("turn_end")!(
+{
+type: "turn_end",
+turnIndex: 0,
+message: assistantMessage,
+toolResults: [],
+messageEntryId: "a1",
+toolResultEntryIds: [],
+entries: [],
+continue: false,
+},
+ctx,
+)
+
+assert.equal(result, undefined)
+assert.equal(calls.complete.length, 0)
+assert.equal(calls.compact.length, 0)
+} finally {
+ws.cleanup()
+}
+})
+
+test("preserveDialogue reports the trigger branch, token split, and final tools/results checkpoint in Pi UI", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const branchEntries = [
+      {
+        type: "message",
+        id: "u1",
+        message: { role: "user", content: "PERMANENT USER REQUIREMENT", timestamp: 1 },
+      },
+      {
+        type: "message",
+        id: "a1",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "PERMANENT VISIBLE ANSWER" },
+            { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+          ],
+          timestamp: 2,
+        },
+      },
+      {
+        type: "message",
+        id: "keep-1",
+        message: {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "read",
+        content: [{ type: "text", text: "COMPACTABLE TOOL RESULT".repeat(100) }],
+        isError: false,
+        timestamp: 3,
+        },
+      },
+    ]
+    const messages = [
+      { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+      branchEntries[0].message,
+      branchEntries[1].message,
+      branchEntries[2].message,
+    ]
+    const { handlers, ctx, calls } = setup({
+    cwd: ws.cwd,
+    hasUI: true,
+    branchEntries,
+    messages,
+    contextUsage: { tokens: 92_000, contextWindow: 100_000, percent: 92 },
+    model: { provider: "mock", id: "test-model", contextWindow: 100_000 },
+    })
+
+    const result = await handlers.get("turn_end")!(
+    {
+    type: "turn_end",
+    turnIndex: 0,
+    message: branchEntries[1].message,
+    toolResults: [branchEntries[2].message],
+    messageEntryId: "a1",
+    toolResultEntryIds: ["keep-1"],
+    entries: [],
+    continue: false,
+    },
+    ctx,
+    )
+
+    assert.equal(result.entries.at(-1).type, "compaction")
+    assert.equal(calls.compact.length, 0)
+    assert.equal(calls.complete.length, 1)
+    const summaryRequestText = JSON.stringify(calls.complete[0].context.messages)
+    assert.match(summaryRequestText, /COMPACTABLE TOOL RESULT/)
+    const preserveAsk = calls.complete[0].context.messages.at(-1).content[0].text
+    assert.doesNotMatch(preserveAsk, /later message\(s\) stay in the context verbatim/)
+    assert.match(calls.notifications[0].message, /normal \(dynamic 90%\)/)
+    assert.match(calls.notifications[0].message, /preserved messages: \d+ tok/)
+    assert.match(calls.notifications[0].message, /compactable messages: \d+ tok/)
+    assert.match(calls.notifications[0].message, /context 92000\/100000 tok/)
+
+    assert.match(calls.notifications.at(-1)!.message, /compact complete: normal \(dynamic 90%\)/)
+assert.match(calls.notifications.at(-1)!.message, /old summary: \d+ tok/)
+assert.match(calls.notifications.at(-1)!.message, /new raw compactable state: \d+ tok/)
+assert.match(calls.notifications.at(-1)!.message, /total compacted state: \d+ tok/)
+assert.match(calls.notifications.at(-1)!.message, /summary size: \d+ tok/)
+assert.match(calls.notifications.at(-1)!.message, /compressed: \d+ tok/)
+assert.match(calls.notifications.at(-1)!.message, /compression: [0-9.]+x/)
+assert.match(calls.notifications.at(-1)!.message, /preserved messages: \d+ tok/)
+assert.match(calls.notifications.at(-1)!.message, /total new context: ~\d+ tok/)
+assert.doesNotMatch(calls.notifications.at(-1)!.message, /recent raw tail/i)
+assert.match(calls.notifications.at(-1)!.message, /tools\/results summary:/)
+assert.match(calls.notifications.at(-1)!.message, /MOCK SUMMARY/)
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test("preserveDialogue labels Pi threshold compaction as emergency", async () => {
+  const ws = tempWorkspace({ preserveDialogue: true })
+  process.env.PI_CODING_AGENT_DIR = ws.agentDir
+  try {
+    const { handler, ctx, calls } = setup({
+      cwd: ws.cwd,
+      hasUI: true,
+      contextUsage: { tokens: 95_000, contextWindow: 100_000, percent: 95 },
+    })
+    await handler(event({ reason: "threshold" }), ctx)
+    assert.match(calls.notifications[0].message, /emergency \(Pi threshold\)/)
+  } finally {
+    ws.cleanup()
+  }
+})
+
 test("preserveDialogue writes a tool-only summary and persists a restoration marker", async () => {
   const ws = tempWorkspace({ preserveDialogue: true })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
@@ -213,7 +454,7 @@ assert.doesNotMatch(askText, /^## Goal$/m)
 })
 
 test("context hook restores old dialogue verbatim and keeps the technical summary once", async () => {
-  const ws = tempWorkspace()
+const ws = tempWorkspace({ preserveDialogue: true })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
   try {
     const branchEntries = [
@@ -276,11 +517,12 @@ test("context hook restores old dialogue verbatim and keeps the technical summar
     assert.deepEqual(restored.messages.map((message: any) => message.role), [
       "user",
       "assistant",
-      "compactionSummary",
       "user",
+      "compactionSummary",
     ])
     assert.equal(restored.messages[0].content, "EXACT OLD PROMPT")
     assert.deepEqual(restored.messages[1].content, [{ type: "text", text: "EXACT OLD RESPONSE" }])
+    assert.equal(restored.messages[2].content, "RECENT PROMPT")
     assert.equal(restored.messages.filter((message: any) => message.role === "compactionSummary").length, 1)
     assert.ok(!JSON.stringify(restored.messages).includes("hidden"))
     assert.ok(!JSON.stringify(restored.messages).includes("tool-1"))
@@ -457,30 +699,37 @@ test("a continuation that would not fit defers to Pi instead of rewinding", asyn
   }
 })
 
-test("preserveDialogue cancels instead of falling back when only a rewind fits", async () => {
-  const ws = tempWorkspace({ preserveDialogue: true, debug: true })
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const huge = "x".repeat(200_000)
-    const { handler, ctx, calls } = setup({
-      cwd: ws.cwd,
-      model: { provider: "mock", id: "test-model", contextWindow: 32_000 },
-      messages: [
-        { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
-        { role: "user", content: "hello from the session", timestamp: 1 },
-        { role: "user", content: huge, timestamp: 3 },
-      ],
-      entries: [
-        { sourceEntry: { id: "sys" }, messages: [{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 }] },
-        { sourceEntry: { id: "u1" }, messages: [{ role: "user", content: "hello from the session", timestamp: 1 }] },
-        { sourceEntry: { id: "keep-1" }, messages: [{ role: "user", content: huge, timestamp: 3 }] },
-      ],
-    })
-    assert.deepEqual(await handler(event(), ctx), { cancel: true })
-    assert.equal(calls.complete.length, 0)
-  } finally {
-    ws.cleanup()
-  }
+test("preserveDialogue surfaces the fail-closed cancellation reason when the full tool state no longer fits", async () => {
+const ws = tempWorkspace({ preserveDialogue: true, debug: true })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const huge = "x".repeat(200_000)
+const { handler, handlers, ctx, calls } = setup({
+cwd: ws.cwd,
+hasUI: true,
+model: { provider: "mock", id: "test-model", contextWindow: 32_000 },
+messages: [
+{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+{ role: "user", content: "hello from the session", timestamp: 1 },
+{ role: "user", content: huge, timestamp: 3 },
+],
+entries: [
+{ sourceEntry: { id: "sys" }, messages: [{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 }] },
+{ sourceEntry: { id: "u1" }, messages: [{ role: "user", content: "hello from the session", timestamp: 1 }] },
+{ sourceEntry: { id: "keep-1" }, messages: [{ role: "user", content: huge, timestamp: 3 }] },
+],
+})
+assert.deepEqual(await handler(event({ reason: "threshold" }), ctx), { cancel: true })
+assert.equal(calls.complete.length, 0)
+handlers.get("session_compact_failed")!(
+{ type: "session_compact_failed", reason: "threshold", willRetry: false, aborted: true },
+ctx,
+)
+assert.match(calls.notifications.at(-1)!.message, /emergency \(Pi threshold\)/)
+assert.match(calls.notifications.at(-1)!.message, /full preserve tool-state summary no longer fits/)
+} finally {
+ws.cleanup()
+}
 })
 
 test("rewindWhenNeeded: true sends the dropped span when nothing else fits", async () => {
@@ -576,16 +825,26 @@ test("falls back to Pi's default when the summary request throws", async () => {
   }
 })
 
-test("ignores sessions whose model is not listed", async () => {
-  const ws = tempWorkspace({ models: ["other/model"] })
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const { handler, ctx, calls } = setup({ cwd: ws.cwd })
-    assert.equal(await handler(event(), ctx), undefined)
-    assert.equal(calls.complete.length, 0)
-  } finally {
-    ws.cleanup()
-  }
+test("ignores sessions whose model is not listed, including preserve restoration and UI", async () => {
+const ws = tempWorkspace({ preserveDialogue: true, models: ["other/model"] })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const branchEntries = [
+{ type: "message", id: "u-old", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", message: { role: "user", content: "OLD", timestamp: 1 } },
+{ type: "compaction", id: "compact-1", parentId: "u-old", timestamp: "2026-01-01T00:00:01.000Z", summary: "TOOLS", firstKeptEntryId: null, tokensBefore: 1000, details: { cacheCompact: { mode: "preserve-dialogue-v1", version: 1 } } },
+]
+const { handler, handlers, ctx, calls } = setup({ cwd: ws.cwd, branchEntries, hasUI: true })
+assert.equal(await handler(event({ branchEntries: branchEntries as any }), ctx), undefined)
+assert.equal(calls.complete.length, 0)
+assert.equal(await handlers.get("context")!({ type: "context", messages: [] }, ctx), undefined)
+handlers.get("session_compact")!(
+{ type: "session_compact", reason: "threshold", willRetry: false, fromExtension: false, compactionEntry: { summary: "PI SUMMARY", tokensBefore: 1000 } },
+ctx,
+)
+assert.equal(calls.notifications.length, 0)
+} finally {
+ws.cleanup()
+}
 })
 
 test("honours a custom prompt, a summarizer model, and custom instructions", async () => {
@@ -679,16 +938,46 @@ test("omits effort when live requests omit it; config overrides observation", as
   }
 })
 
-test("runs the default summary when disabled", async () => {
-  const ws = tempWorkspace({ enabled: false })
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const { handler, ctx, calls } = setup({ cwd: ws.cwd })
-    assert.equal(await handler(event(), ctx), undefined)
-    assert.equal(calls.complete.length, 0)
-  } finally {
-    ws.cleanup()
-  }
+test("malformed config falls back to the documented preserveDialogue default", async () => {
+const ws = tempWorkspace()
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+fs.writeFileSync(path.join(ws.cwd, ".pi", "cache-compact.json"), "{")
+const { handler, ctx } = setup({ cwd: ws.cwd })
+const result = (await handler(event(), ctx)) as any
+assert.deepEqual(result.compaction.details.cacheCompact, {
+mode: "preserve-dialogue-v1",
+version: 1,
+})
+} finally {
+ws.cleanup()
+}
+})
+
+test("disabled mode leaves Pi compaction, context, and UI untouched", async () => {
+const ws = tempWorkspace({ enabled: false })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const branchEntries = [
+{ type: "message", id: "u-old", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", message: { role: "user", content: "OLD", timestamp: 1 } },
+{ type: "compaction", id: "compact-1", parentId: "u-old", timestamp: "2026-01-01T00:00:01.000Z", summary: "TOOLS", firstKeptEntryId: null, tokensBefore: 1000, details: { cacheCompact: { mode: "preserve-dialogue-v1", version: 1 } } },
+]
+const { handler, handlers, ctx, calls } = setup({ cwd: ws.cwd, branchEntries, hasUI: true })
+assert.equal(await handler(event({ branchEntries: branchEntries as any }), ctx), undefined)
+assert.equal(calls.complete.length, 0)
+const restored = await handlers.get("context")!(
+{ type: "context", messages: [{ role: "compactionSummary", summary: "TOOLS", tokensBefore: 1000, timestamp: 2 }] },
+ctx,
+)
+assert.equal(restored, undefined)
+handlers.get("session_compact")!(
+{ type: "session_compact", reason: "threshold", willRetry: false, fromExtension: false, compactionEntry: { summary: "PI SUMMARY", tokensBefore: 1000 } },
+ctx,
+)
+assert.equal(calls.notifications.length, 0)
+} finally {
+ws.cleanup()
+}
 })
 
 function readRecords(file: string): any[] {

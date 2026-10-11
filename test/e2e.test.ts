@@ -241,7 +241,7 @@ fs.writeFileSync(path.join(project, "probe.txt"), options.probeContent ?? "hello
           // on our summary request through the same model, proving the mock
           // records headers so the header-replay assertions mean something.
           headers: { "x-e2e-pin": "pin-42" },
-          models: [{ id: "test-model", name: "Mock", reasoning: true, contextWindow: 1000, maxTokens: 512 }],
+          models: [{ id: "test-model", name: "Mock", reasoning: true, contextWindow: 3000, maxTokens: 512 }],
         },
       },
     }),
@@ -250,7 +250,7 @@ fs.writeFileSync(path.join(project, "probe.txt"), options.probeContent ?? "hello
     path.join(agentDir, "settings.json"),
     JSON.stringify({
       defaultModel: "mock/test-model",
-      compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 10 },
+      compaction: { enabled: true, reserveTokens: 2100, keepRecentTokens: 10 },
     }),
   )
 
@@ -551,12 +551,14 @@ isToolSummaryRequest(request) && !isToolSummaryRequest(mock.requests[index - 1])
 : -1,
 )
 .filter((index) => index >= 0)
-assert.ok(
-summaryIndexes.length >= 2,
-`expected at least two preserve-dialogue compactions, got ${summaryIndexes.length}\n${context}`,
+assert.equal(
+summaryIndexes.length,
+2,
+`expected exactly the two tool-bearing preserve-dialogue compactions, got ${summaryIndexes.length}\n${context}`,
 )
 
-for (const summaryIndex of summaryIndexes.slice(0, 2)) {
+const expectedToolOutputs = ["FIRST TOOL OUTPUT", "SECOND TOOL OUTPUT"]
+for (const [ordinal, summaryIndex] of summaryIndexes.slice(0, 2).entries()) {
 const summaryReq = mock.requests[summaryIndex]
 const previous = mock.requests[summaryIndex - 1]
 assert.ok(previous, `no live request before summary #${summaryIndex}\n${context}`)
@@ -574,6 +576,16 @@ assert.equal(
 summaryReq.body.reasoning_effort,
 previous.body.reasoning_effort,
 `summary #${summaryIndex} changed reasoning_effort\n${context}`,
+)
+assert.ok(
+JSON.stringify(summaryReq.body.messages).includes(expectedToolOutputs[ordinal]),
+`summary #${summaryIndex} omitted tool output from Pi's nominal kept tail\n${context}`,
+)
+const ask = textOf(lastMessage(summaryReq.body)?.content)
+assert.doesNotMatch(
+ask,
+/stay in the context verbatim/,
+`preserve summary #${summaryIndex} incorrectly retained a pre-compaction tail\n${context}`,
 )
 }
 
@@ -616,9 +628,10 @@ rendered.split(SUMMARY_TEXT).length - 1,
 1,
 `technical summary must appear exactly once in the final model context\n${context}`,
 )
-assert.ok(!rendered.includes("FIRST TOOL OUTPUT"), `compacted tool output leaked back into model context\n${context}`)
-assert.ok(!rendered.includes("call_1"), `compacted tool call leaked back into model context\n${context}`)
-// The newest tool interaction may legitimately remain in Pi's retained tail.
+assert.ok(!rendered.includes("FIRST TOOL OUTPUT"), `first compacted tool output leaked back into model context\n${context}`)
+assert.ok(!rendered.includes("SECOND TOOL OUTPUT"), `second compacted tool output leaked back into model context\n${context}`)
+assert.ok(!rendered.includes("call_1"), `first compacted tool call leaked back into model context\n${context}`)
+assert.ok(!rendered.includes("call_2"), `second compacted tool call leaked back into model context\n${context}`)
 
 const sessionText = fs
 .readdirSync(run.agentDir, { recursive: true })

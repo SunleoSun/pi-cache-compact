@@ -7,16 +7,15 @@
  * never reuse the KV cache, so the whole conversation is re-prefilled just to
  * produce the summary — the expensive part you were trying to avoid.
  *
- * This extension leaves Pi's trigger and cut alone and replaces only the
- * summarization call. It asks for the summary as a strict continuation of the
- * live conversation (same system prompt, same tools, same messages, one
- * appended user turn), so a prefix-caching server serves everything but the ask
- * from cache and only generates the summary.
+ * In preserve-dialogue mode the extension also owns normal compaction timing:
+ * at safe `turn_end` boundaries it checks pressure and, when needed, writes a
+ * preserve compaction boundary before the next provider request. Emergency
+ * threshold/overflow compaction still enters through `session_before_compact`.
  *
- * It hooks `session_before_compact`, so Pi still decides when to compact, keeps
- * the recent tail, and appends the compaction entry. If the summary is empty,
- * truncated, or errors, the handler returns nothing and Pi's default summary
- * runs instead.
+ * The summary itself is asked as a strict continuation of the live conversation
+ * (same system prompt, same tools, same messages, one appended user turn), so a
+ * prefix-caching server serves everything but the ask from cache. Normal mode
+ * still only replaces Pi's summarization call.
  */
 
 import { join } from "node:path"
@@ -36,16 +35,21 @@ import {
   activeToolDeclarations,
   buildSummaryContext,
   computeFileLists,
+computeFileListsFromMessages,
   formatFileOperations,
   extractLiveReasoningEffort,
   extractSummaryText,
   isModelAllowed,
   messagesBeforeEntry,
+  estimateMessagesTokens,
   planSummaryRequest,
+  preserveCompactionBudget,
+  PRESERVE_DYNAMIC_HEADROOM_MARGIN_TOKENS,
   replayableHeaders,
   resolveSummaryReasoningEffort,
   summaryRejection,
   summaryOutputCap,
+  tokenScale,
   looksLikeToolCall,
   NO_TEXT_REPLY,
   TOOL_CALL_TEXT_REPLY,
@@ -53,16 +57,14 @@ import {
   type SummaryRequestPlan,
   type SummaryRequestShape,
 } from "./build.ts"
-import {
-  DEFAULT_SUMMARY_MAX_TOKENS,
-  readOptions,
-  type CacheCompactOptions,
-} from "./config.ts"
+import { readOptions, type CacheCompactOptions } from "./config.ts"
 import { DebugLogger, fingerprintPayload, redactHeaders, shortHash, snapshot } from "./debug.ts"
 import {
-  PRESERVE_DIALOGUE_MARKER,
-  rebuildPreservedDialogue,
-  type CacheCompactDetails,
+PRESERVE_DIALOGUE_MARKER,
+isPreserveDialogueCompaction,
+preservedDialogueMessages,
+rebuildPreservedDialogue,
+type CacheCompactDetails,
 } from "./preserve.ts"
 
 export type { CacheCompactOptions } from "./config.ts"
@@ -110,6 +112,81 @@ function describeContent(
 function head(text: string, limit = 160): string {
   const collapsed = text.replace(/\s+/g, " ").trim()
   return collapsed.length > limit ? `${collapsed.slice(0, limit)}…` : collapsed
+}
+
+function effectiveAgentMessages(
+  projectedAgent: readonly AgentMessage[],
+  branchEntries: readonly SessionEntry[],
+): AgentMessage[] {
+  let systemCount = 0
+  while (projectedAgent[systemCount]?.role === "system") systemCount += 1
+  const rebuiltConversation = rebuildPreservedDialogue(
+    projectedAgent.slice(systemCount),
+    branchEntries,
+  )
+  return rebuiltConversation
+    ? [...projectedAgent.slice(0, systemCount), ...rebuiltConversation]
+    : [...projectedAgent]
+}
+
+type CompactionBranch = "normal (dynamic 90%)" | "emergency (Pi threshold)" | "overflow recovery" | "manual /compact"
+
+function compactionBranch(
+  reason: "manual" | "threshold" | "overflow",
+  dynamic: boolean,
+): CompactionBranch {
+  if (dynamic) return "normal (dynamic 90%)"
+  if (reason === "threshold") return "emergency (Pi threshold)"
+  if (reason === "overflow") return "overflow recovery"
+  return "manual /compact"
+}
+
+function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
+  if (!ctx.hasUI) return
+  try {
+    ctx.ui.notify(message, type)
+  } catch {
+    // A UI notification must never affect compaction.
+  }
+}
+
+type CompactionTokenBreakdown = {
+preserved: number
+oldSummary: number
+newRawCompactable: number
+compactable: number
+nonSystemTotal: number
+scale: number
+}
+
+function compactionMessageTokens(
+ctx: ExtensionContext,
+branchEntries: readonly SessionEntry[],
+): CompactionTokenBreakdown {
+const projection = ctx.sessionManager.buildSessionProjection()
+const effectiveAgent = effectiveAgentMessages(
+projection.messages as AgentMessage[],
+branchEntries,
+)
+const liveMessages = convertToLlm(effectiveAgent)
+const scale = tokenScale(liveMessages)
+const nonSystemMessages = liveMessages.filter((message) => message.role !== "system")
+const preservedMessages = convertToLlm(preservedDialogueMessages(branchEntries))
+const oldSummaryMessages = convertToLlm(
+effectiveAgent.filter((message) => message.role === "compactionSummary"),
+)
+const nonSystemTotal = Math.ceil(estimateMessagesTokens(nonSystemMessages) * scale)
+const preserved = Math.ceil(estimateMessagesTokens(preservedMessages) * scale)
+const oldSummary = Math.ceil(estimateMessagesTokens(oldSummaryMessages) * scale)
+const compactable = Math.max(0, nonSystemTotal - preserved)
+return {
+preserved,
+oldSummary: Math.min(oldSummary, compactable),
+newRawCompactable: Math.max(0, compactable - oldSummary),
+compactable,
+nonSystemTotal,
+scale,
+}
 }
 
 /** Summarize with `summaryModel` when configured and resolvable, else the active model. */
@@ -221,7 +298,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       join(getAgentDir(), "cache-compact.json"),
       join(ctx.cwd, CONFIG_DIR_NAME, "cache-compact.json"),
     ]
-    let options: CacheCompactOptions = {}
+    let options: CacheCompactOptions = { preserveDialogue: true }
     try {
       options = readOptions(paths)
     } catch (error) {
@@ -272,19 +349,279 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   // — far more so than Pi's little truncated prompt. See `deferAfterCacheMiss`.
   const lastSummaryOutcome = new Map<string, { at: number; missed: boolean }>()
 
-// A preserve-dialogue compaction hides old entries from Pi's normal
-// projection, but the raw branch is append-only. Rebuild the model view on
-// every live request so user prompts and visible assistant prose remain
-// verbatim while tool history stays compacted and old reasoning stays discarded.
-pi.on("context", (event, ctx) => {
-    try {
-      const messages = rebuildPreservedDialogue(event.messages, ctx.sessionManager.getBranch())
+// Preserve-aware boundary compactions are asynchronous. Keep one in flight
+// per session so no overlapping boundary work can race the same branch.
+const dynamicCompactions = new Set<string>()
+
+type PendingCompactionUi = {
+  branch: CompactionBranch
+  tokens: CompactionTokenBreakdown
+  contextTokens?: number
+  contextWindow?: number
+}
+const pendingCompactionUi = new Map<string, PendingCompactionUi>()
+const compactionFailureReasons = new Map<string, string>()
+
+const reportCompactionComplete = (
+ctx: ExtensionContext,
+fallbackBranch: CompactionBranch,
+summary: string,
+tokensBefore: number,
+): void => {
+const sessionId = ctx.sessionManager.getSessionId()
+const pending = pendingCompactionUi.get(sessionId)
+pendingCompactionUi.delete(sessionId)
+compactionFailureReasons.delete(sessionId)
+const branch = pending?.branch ?? fallbackBranch
+
+let metrics = ""
+if (pending) {
+const summaryMessage = {
+role: "compactionSummary",
+summary,
+tokensBefore,
+timestamp: Date.now(),
+} as AgentMessage
+const summarySize = Math.ceil(
+estimateMessagesTokens(convertToLlm([summaryMessage])) * pending.tokens.scale,
+)
+const compressed = Math.max(0, pending.tokens.compactable - summarySize)
+const compression =
+summarySize > 0 ? (pending.tokens.compactable / summarySize).toFixed(1) : "∞"
+const overhead =
+pending.contextTokens === undefined
+? undefined
+: Math.max(0, pending.contextTokens - pending.tokens.nonSystemTotal)
+const totalNew = pending.tokens.preserved + summarySize + (overhead ?? 0)
+metrics = [
+`old summary: ${pending.tokens.oldSummary} tok`,
+`new raw compactable state: ${pending.tokens.newRawCompactable} tok`,
+`total compacted state: ${pending.tokens.compactable} tok`,
+"",
+`summary size: ${summarySize} tok`,
+`compressed: ${compressed} tok`,
+`compression: ${compression}x`,
+"",
+`preserved messages: ${pending.tokens.preserved} tok`,
+...(overhead === undefined ? [] : [`system/tools overhead: ~${overhead} tok`]),
+`total new context: ~${totalNew} tok`,
+"",
+].join("\n")
+}
+
+notify(
+ctx,
+`[cache-compact] compact complete: ${branch}\n${metrics}tools/results summary:\n${summary.trim() || "(empty)"}`,
+"info",
+)
+}
+
+const reportCompactionFailure = (
+ctx: ExtensionContext,
+fallbackBranch: CompactionBranch,
+aborted: boolean,
+errorMessage?: string,
+): void => {
+const sessionId = ctx.sessionManager.getSessionId()
+const pending = pendingCompactionUi.get(sessionId)
+pendingCompactionUi.delete(sessionId)
+const branch = pending?.branch ?? fallbackBranch
+const detail = compactionFailureReasons.get(sessionId) ?? errorMessage
+compactionFailureReasons.delete(sessionId)
+notify(
+ctx,
+`[cache-compact] compact ${aborted ? "cancelled" : "failed"}: ${branch}${detail ? `\n${detail}` : ""}`,
+aborted ? "warning" : "error",
+)
+}
+
+  // A preserve-dialogue compaction hides old entries from Pi's normal
+  // projection, but the raw branch is append-only. Rebuild the model view on
+  // every live request so user prompts and visible assistant prose remain
+  // verbatim while tool history stays compacted and old reasoning stays discarded.
+  pi.on("context", (event, ctx) => {
+  const options = optionsFor(ctx)
+  const model = ctx.model
+  if (
+  options.enabled === false ||
+  options.preserveDialogue !== true ||
+  !model ||
+  !isModelAllowed(options.models, model.provider, model.id)
+  ) return undefined
+  try {
+  const messages = rebuildPreservedDialogue(event.messages, ctx.sessionManager.getBranch())
       return messages ? { messages } : undefined
     } catch {
       // Context restoration must never break a request. Without a usable
       // marker/boundary Pi's native compacted projection remains valid.
       return undefined
     }
+  })
+
+  // Preserve-mode pressure is handled only at a tool-bearing turn boundary: by
+  // turn_end every tool result from that turn is persisted, while the next
+  // provider request has not started yet. Calling ctx.compact() here
+  // would abort the active agent run, so write the generated preserve checkpoint
+  // through Pi's boundary API instead. Pi's native threshold remains the
+  // emergency/overflow fallback when a single turn overshoots before this point.
+  pi.on("turn_end", async (event, ctx) => {
+    const options = optionsFor(ctx)
+    const model = ctx.model
+    if (
+      options.enabled === false ||
+      options.preserveDialogue !== true ||
+      !model ||
+      !isModelAllowed(options.models, model.provider, model.id) ||
+      event.toolResults.length === 0 ||
+      event.entries.some((entry) => entry.type === "compaction")
+    ) {
+      return
+    }
+
+    const usage = ctx.getContextUsage()
+    if (!usage || usage.tokens === null || usage.contextWindow <= 0) return
+
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (dynamicCompactions.has(sessionId)) return
+
+    const log = loggerFor(options)
+    try {
+      const branchEntries = ctx.sessionManager.getBranch() as SessionEntry[]
+      const tokens = compactionMessageTokens(ctx, branchEntries)
+      // If the latest preserve checkpoint already owns all compactable state,
+      // another compaction cannot reclaim anything. In particular, visible-only
+      // assistant turns after a checkpoint must not cause a compaction loop merely
+      // because fixed system/tool overhead keeps pressure above the threshold.
+      if (tokens.newRawCompactable <= 0) return
+      const preservedTokens = tokens.preserved
+      const summarizer = resolveSummarizer(ctx, options, model)
+      const summaryLimit = summaryOutputCap({
+      configured: options.summaryMaxTokens,
+      modelMaxTokens: summarizer.maxTokens,
+      droppedTokens: tokens.compactable,
+      })
+      const headroomTokens = summaryLimit + PRESERVE_DYNAMIC_HEADROOM_MARGIN_TOKENS
+      const budget = preserveCompactionBudget({
+        contextTokens: usage.tokens,
+        contextWindow: usage.contextWindow,
+        preservedTokens,
+        headroomTokens,
+      })
+
+      log.record("dynamic_compaction_pressure", {
+        sessionId,
+        boundary: "turn_end",
+        contextTokens: usage.tokens,
+        contextWindow: usage.contextWindow,
+        preservedTokens: budget.preservedTokens,
+        availableTokens: budget.availableTokens,
+        occupiedTokens: budget.occupiedTokens,
+        thresholdTokens: budget.thresholdTokens,
+        pressure: budget.pressure,
+        headroomTokens,
+        newRawCompactableTokens: tokens.newRawCompactable,
+        trigger: budget.shouldCompact,
+      })
+      if (!budget.shouldCompact) return
+
+      dynamicCompactions.add(sessionId)
+      log.both("dynamic preserve compaction triggered at turn boundary", {
+        sessionId,
+        contextTokens: usage.tokens,
+        contextWindow: usage.contextWindow,
+        preservedTokens: budget.preservedTokens,
+        pressure: budget.pressure,
+      })
+
+      const previousPreserve = [...branchEntries].reverse().find(isPreserveDialogueCompaction)
+      const syntheticEvent = {
+        type: "session_before_compact",
+        preparation: {
+          firstKeptEntryId: event.messageEntryId,
+          tokensBefore: usage.tokens,
+          messagesToSummarize: [],
+          turnPrefixMessages: [],
+          ...(previousPreserve ? { previousSummary: previousPreserve.summary } : {}),
+          fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+        },
+        branchEntries,
+        customInstructions: undefined,
+        reason: "manual",
+        willRetry: false,
+        signal: ctx.signal ?? new AbortController().signal,
+      } as unknown as SessionBeforeCompactEvent
+
+      const result = await handleCompaction(syntheticEvent, ctx)
+      if (!result?.compaction) {
+        reportCompactionFailure(ctx, "normal (dynamic 90%)", true)
+        log.record("dynamic_compaction_complete", { sessionId, cancelled: true })
+        return
+      }
+
+      reportCompactionComplete(
+        ctx,
+        "normal (dynamic 90%)",
+        result.compaction.summary,
+        usage.tokens,
+      )
+      log.record("dynamic_compaction_complete", { sessionId, cancelled: false })
+
+      return {
+        entries: [
+          ...event.entries,
+          {
+            type: "compaction" as const,
+            summary: result.compaction.summary,
+            firstKeptEntryId: null,
+            details: result.compaction.details,
+            usage: result.compaction.usage,
+          },
+        ],
+      }
+    } catch (error) {
+      reportCompactionFailure(ctx, "normal (dynamic 90%)", false, String(error))
+      log.record("dynamic_compaction_check_failed", {
+        sessionId,
+        error: String(error),
+      })
+      return
+    } finally {
+      dynamicCompactions.delete(sessionId)
+    }
+  })
+
+  pi.on("session_compact", (event, ctx) => {
+  const options = optionsFor(ctx)
+  const model = ctx.model
+  if (
+  options.enabled === false ||
+  options.preserveDialogue !== true ||
+  !model ||
+  !isModelAllowed(options.models, model.provider, model.id)
+  ) return
+  reportCompactionComplete(
+      ctx,
+      compactionBranch(event.reason, dynamicCompactions.has(ctx.sessionManager.getSessionId())),
+      event.compactionEntry.summary,
+      event.compactionEntry.tokensBefore,
+    )
+  })
+
+  pi.on("session_compact_failed", (event, ctx) => {
+  const options = optionsFor(ctx)
+  const model = ctx.model
+  if (
+  options.enabled === false ||
+  options.preserveDialogue !== true ||
+  !model ||
+  !isModelAllowed(options.models, model.provider, model.id)
+  ) return
+  reportCompactionFailure(
+      ctx,
+      compactionBranch(event.reason, dynamicCompactions.has(ctx.sessionManager.getSessionId())),
+      event.aborted,
+      event.errorMessage,
+    )
   })
 
   // Fingerprint every outgoing provider request — live turns and our own
@@ -376,29 +713,65 @@ pi.on("context", (event, ctx) => {
     }
   })
 
-  pi.on("session_before_compact", async (event, ctx): Promise<SessionBeforeCompactResult | undefined> => {
+  const handleCompaction = async (
+  event: SessionBeforeCompactEvent,
+  ctx: ExtensionContext,
+  ): Promise<SessionBeforeCompactResult | undefined> => {
     const options = optionsFor(ctx)
     const log = loggerFor(options)
     // Pi compacts whether or not we win the hook, so the next live request is
     // the "after" side of the payload dump on every path.
     const sessionId = ctx.sessionManager.getSessionId()
-    if (options.debug === true && options.debugFile && options.debugPayloads === true) {
-      dumpNextLive.add(sessionId)
-    }
     if (options.enabled === false) return
-
     const model = ctx.model
-    if (!model) return
-    if (!isModelAllowed(options.models, model.provider, model.id)) return
+    if (!model || !isModelAllowed(options.models, model.provider, model.id)) return
+    compactionFailureReasons.delete(sessionId)
+    if (options.preserveDialogue === true) {
+const branch = compactionBranch(event.reason, dynamicCompactions.has(sessionId))
+try {
+const tokens = compactionMessageTokens(ctx, event.branchEntries as SessionEntry[])
+const usage = ctx.getContextUsage()
+const contextTokens =
+usage?.tokens === null || usage === undefined ? undefined : usage.tokens
+pendingCompactionUi.set(sessionId, {
+branch,
+tokens,
+...(contextTokens === undefined ? {} : { contextTokens }),
+...(usage === undefined ? {} : { contextWindow: usage.contextWindow }),
+})
+const context =
+contextTokens === undefined || usage === undefined
+? ""
+: ` | context ${contextTokens}/${usage.contextWindow} tok`
+notify(
+ctx,
+`[cache-compact] ${branch}\npreserved messages: ${tokens.preserved} tok | compactable messages: ${tokens.compactable} tok${context}`,
+event.reason === "overflow" ? "warning" : "info",
+)
+} catch {
+pendingCompactionUi.delete(sessionId)
+notify(ctx, `[cache-compact] ${branch}`, event.reason === "overflow" ? "warning" : "info")
+}
+}
+    if (options.debug === true && options.debugFile && options.debugPayloads === true) {
+    dumpNextLive.add(sessionId)
+    }
 
     const preserveFallback = (
       message: string,
       data: Record<string, unknown>,
     ): SessionBeforeCompactResult | undefined => {
       if (options.preserveDialogue === true) {
-        dumpNextLive.delete(sessionId)
-        log.both(`${message}; cancelling compaction to preserve dialogue`, data)
-        return { cancel: true }
+      dumpNextLive.delete(sessionId)
+      const detail =
+      typeof data.reason === "string"
+      ? `${message}: ${data.reason}`
+      : typeof data.error === "string"
+      ? `${message}: ${data.error}`
+      : message
+      compactionFailureReasons.set(sessionId, detail)
+      log.both(`${message}; cancelling compaction to preserve dialogue`, data)
+      return { cancel: true }
       }
       log.both(`${message}; leaving compaction to Pi`, data)
       return undefined
@@ -422,55 +795,71 @@ pi.on("context", (event, ctx) => {
       })
     }
 
-    // Plan the request once, here, so the `before_provider_request` fallback
-    // hash matches the ask that is actually sent (the ask grows a boundary note
-    // when the request carries the kept tail).
-    const projection = ctx.sessionManager.buildSessionProjection()
-    const droppedAgent = (messagesBeforeEntry(projection.entries, event.preparation.firstKeptEntryId) ?? [
-      ...event.preparation.messagesToSummarize,
-      ...event.preparation.turnPrefixMessages,
-    ]) as AgentMessage[]
-    // The live request's messages are a prefix of the projection (Pi only
-    // appends between requests), so slicing to the observed count reconstructs
-    // the exact prompt the server has cached. Falls back to the whole
-    // projection when no request has been observed yet, or after a compaction
-    // shortened the projection under the recorded count.
-    const projectedAgent = projection.messages as AgentMessage[]
-    let systemCount = 0
-    while (projectedAgent[systemCount]?.role === "system") systemCount += 1
-    const rebuiltConversation = rebuildPreservedDialogue(
-      projectedAgent.slice(systemCount),
-      event.branchEntries as SessionEntry[],
-    )
-    const effectiveAgent = rebuiltConversation
-      ? [...projectedAgent.slice(0, systemCount), ...rebuiltConversation]
-      : projectedAgent
-    const liveMessages = convertToLlm(effectiveAgent)
-    const observedCount = liveRequestCounts.get(sessionId)
-    const requestMessages =
-      observedCount !== undefined && observedCount > 0 && observedCount < liveMessages.length
-        ? liveMessages.slice(0, observedCount)
-        : liveMessages
-    const plan = planSummaryRequest({
-      liveMessages,
-      requestMessages,
-      droppedMessages: convertToLlm(droppedAgent),
-      keptCount: projection.messages.length - droppedAgent.length,
-      // Pi splits a turn when the cut lands mid-turn: the retained suffix is the
-      // rest of that turn, and its summary goes under a marker heading.
-      turnPrefixCount: event.preparation.turnPrefixMessages?.length ?? 0,
-      ...(event.preparation.previousSummary
-        ? { previousSummary: event.preparation.previousSummary }
-        : undefined),
-      options,
-      customInstructions: event.customInstructions,
-      contextWindow: (summarizer as { contextWindow?: number }).contextWindow,
-      // Pi's ceiling, bounded by what this compaction reclaims and clamped to
-      // the model; `summaryMaxTokens` overrides all of it.
-      reserveTokens: event.preparation.settings?.reserveTokens,
-      modelMaxTokens: (summarizer as { maxTokens?: number }).maxTokens,
-      summaryMaxTokens: options.summaryMaxTokens,
-    })
+// Preserve mode has a stronger semantic boundary than Pi's native cut:
+// every tool interaction that exists *now* must be absorbed into the
+// technical checkpoint. Pi's firstKeptEntryId / keepRecentTokens may still
+// describe how its raw projection is persisted, but they do not define the
+// model-visible preservation boundary.
+const projection = ctx.sessionManager.buildSessionProjection()
+const projectedAgent = projection.messages as AgentMessage[]
+const effectiveAgent = effectiveAgentMessages(
+projectedAgent,
+event.branchEntries as SessionEntry[],
+)
+const nativeDroppedAgent = (messagesBeforeEntry(
+projection.entries,
+event.preparation.firstKeptEntryId,
+) ?? [
+...event.preparation.messagesToSummarize,
+...event.preparation.turnPrefixMessages,
+]) as AgentMessage[]
+const summaryScopeAgent =
+options.preserveDialogue === true ? effectiveAgent : nativeDroppedAgent
+const liveMessages = convertToLlm(effectiveAgent)
+const observedCount = liveRequestCounts.get(sessionId)
+const requestMessages =
+observedCount !== undefined && observedCount > 0 && observedCount < liveMessages.length
+? liveMessages.slice(0, observedCount)
+: liveMessages
+const plan = planSummaryRequest({
+liveMessages,
+requestMessages,
+droppedMessages: convertToLlm(summaryScopeAgent),
+keptCount:
+options.preserveDialogue === true
+? 0
+: projection.messages.length - nativeDroppedAgent.length,
+// In preserve mode there is no retained pre-compaction turn suffix in
+// the rebuilt model view: all old tool traffic is summarized and all old
+// dialogue is restored independently.
+turnPrefixCount:
+options.preserveDialogue === true
+? 0
+: event.preparation.turnPrefixMessages?.length ?? 0,
+...(event.preparation.previousSummary
+? { previousSummary: event.preparation.previousSummary }
+: undefined),
+options,
+customInstructions: event.customInstructions,
+contextWindow: (summarizer as { contextWindow?: number }).contextWindow,
+reserveTokens: event.preparation.settings?.reserveTokens,
+modelMaxTokens: (summarizer as { maxTokens?: number }).maxTokens,
+summaryMaxTokens: options.summaryMaxTokens,
+...(options.preserveDialogue === true
+? { reclaimedTokens: compactionMessageTokens(ctx, event.branchEntries as SessionEntry[]).compactable }
+: undefined),
+})
+// Preserve mode must absorb every tool interaction that exists at this
+    // compaction. If the complete tool-state request no longer fits, a native
+    // Pi cut or partial rewind would leave some tool traffic raw, violating the
+    // mode's contract, so fail closed before sending a doomed request.
+    if (options.preserveDialogue === true && !plan.requestFits) {
+      return preserveFallback("full preserve tool-state summary no longer fits", {
+        sessionId,
+        tokensBefore: event.preparation.tokensBefore,
+      })
+    }
+
     // The rewind is the one shape that has never reused a cache, and it costs
     // the whole conversation as a cold prefill — more than Pi's own small
     // summary, which is why it is now a deliberate opt-in.
@@ -683,8 +1072,14 @@ pi.on("context", (event, ctx) => {
     // Pi appends a machine-computed file list to every summary; the model's
       // text is only the prose part. Mirroring it keeps summaries identical in
       // shape whichever path produced them.
-    const { readFiles, modifiedFiles } = computeFileLists(event.preparation.fileOps)
-    const summary = extractSummaryText(response.content) + formatFileOperations(readFiles, modifiedFiles)
+const previousPreserve = [...(event.branchEntries as SessionEntry[])]
+.reverse()
+.find(isPreserveDialogueCompaction)
+const { readFiles, modifiedFiles } =
+options.preserveDialogue === true
+? computeFileListsFromMessages(effectiveAgent, previousPreserve?.details)
+: computeFileLists(event.preparation.fileOps)
+const summary = extractSummaryText(response.content) + formatFileOperations(readFiles, modifiedFiles)
     const details: CacheCompactDetails = {
       readFiles,
       modifiedFiles,
@@ -722,10 +1117,12 @@ pi.on("context", (event, ctx) => {
         },
       }
     } catch (error) {
-      return preserveFallback("summary request failed", {
-        sessionId,
-        error: String(error),
-      })
+    return preserveFallback("summary request failed", {
+    sessionId,
+    error: String(error),
+    })
     }
-  })
-}
+    }
+
+    pi.on("session_before_compact", handleCompaction)
+    }

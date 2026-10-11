@@ -4,7 +4,8 @@ import assert from "node:assert/strict"
 import {
   activeToolDeclarations,
   buildSummaryContext,
-  computeFileLists,
+computeFileLists,
+computeFileListsFromMessages,
   continuationFits,
   extractLiveReasoningEffort,
   extractSummaryText,
@@ -12,8 +13,9 @@ import {
   isModelAllowed,
   PI_TURN_PREFIX_FORMAT,
   PI_TURN_PREFIX_PROMPT,
-  summaryOutputCap,
-  tokenScale,
+preserveCompactionBudget,
+summaryOutputCap,
+tokenScale,
   looksLikeToolCall,
   messageSnippet,
   messagesBeforeEntry,
@@ -350,9 +352,29 @@ test("planSummaryRequest does not use a cached request that stops before a resto
   })
 
   assert.notEqual(plan.shape, "continuation-request")
-})
+  })
 
-test("planSummaryRequest continues the last live request when the projection is too big", () => {
+  test("planSummaryRequest bounds preserve summary output by actually reclaimed state", () => {
+  const preservedDialogue = { role: "user", content: "x".repeat(200_000) } as any
+  const compactableToolState = { role: "toolResult", content: [{ type: "text", text: "y".repeat(20_000) }] } as any
+  const liveMessages = [preservedDialogue, compactableToolState]
+
+  const plan = planSummaryRequest({
+  liveMessages,
+  requestMessages: liveMessages,
+  droppedMessages: liveMessages,
+  keptCount: 0,
+  options: { preserveDialogue: true },
+  contextWindow: 300_000,
+  reserveTokens: 16_384,
+  modelMaxTokens: 32_000,
+  reclaimedTokens: 5_000,
+  })
+
+  assert.equal(plan.maxTokens, 2_500)
+  })
+
+  test("planSummaryRequest continues the last live request when the projection is too big", () => {
   // The production case: a 100 KB tool result arrives after the last request, so
   // the whole projection no longer fits the window — but the request the server
   // has cached still does, and appending the ask to *it* is still a forward
@@ -553,6 +575,52 @@ test("summaryRejection refuses tool-call syntax written as text", () => {
     undefined,
   )
   assert.equal(looksLikeToolCall("## Goal\nFix the tool call handling."), false)
+})
+
+test("preserveCompactionBudget triggers at 90% of space left after preserved dialogue", () => {
+const below = preserveCompactionBudget({
+contextTokens: 262_999,
+contextWindow: 300_000,
+preservedTokens: 20_000,
+headroomTokens: 10_000,
+})
+assert.equal(below.availableTokens, 270_000)
+assert.equal(below.thresholdTokens, 243_000)
+assert.equal(below.occupiedTokens, 242_999)
+assert.equal(below.shouldCompact, false)
+
+const atThreshold = preserveCompactionBudget({
+contextTokens: 263_000,
+contextWindow: 300_000,
+preservedTokens: 20_000,
+headroomTokens: 10_000,
+})
+assert.equal(atThreshold.occupiedTokens, 243_000)
+assert.equal(atThreshold.shouldCompact, true)
+
+const dialogueHeavy = preserveCompactionBudget({
+contextTokens: 284_000,
+contextWindow: 300_000,
+preservedTokens: 230_000,
+headroomTokens: 10_000,
+})
+assert.equal(dialogueHeavy.availableTokens, 60_000)
+assert.equal(dialogueHeavy.thresholdTokens, 54_000)
+assert.equal(dialogueHeavy.shouldCompact, true)
+})
+
+test("computeFileListsFromMessages includes all tool calls and merges prior checkpoint state", () => {
+const result = computeFileListsFromMessages(
+[
+{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "kept-tail.ts" } }] },
+{ role: "assistant", content: [{ type: "toolCall", name: "write", arguments: { path: "old-read.ts" } }] },
+{ role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "edited.ts" } }] },
+{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "edited.ts" } }] },
+],
+{ readFiles: ["old-read.ts", "prior-read.ts"], modifiedFiles: ["prior-modified.ts"] },
+)
+assert.deepEqual(result.readFiles, ["kept-tail.ts", "prior-read.ts"])
+assert.deepEqual(result.modifiedFiles, ["edited.ts", "old-read.ts", "prior-modified.ts"])
 })
 
 test("summaryOutputCap derives Pi's ceiling, bounded by what is reclaimed", () => {

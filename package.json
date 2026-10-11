@@ -1,11 +1,10 @@
 {
   "name": "pi-cache-compact-preserved-messages",
-  "version": "1.0.0",
+"version": "1.1.1",
   "description": "Cache-friendly Pi compaction that preserves historical user messages and visible assistant responses verbatim.",
   "type": "module",
-  "license": "MIT",
-  "author": "Lennart Schoch",
-  "main": "src/extension.ts",
+"license": "MIT",
+"main": "src/extension.ts",
   "exports": {
     ".": "./src/extension.ts"
   },
@@ -19,14 +18,6 @@
     "extensions": [
       "./src/extension.ts"
     ]
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/lennartschoch/pi-cache-compact.git"
-  },
-  "homepage": "https://github.com/lennartschoch/pi-cache-compact#readme",
-  "bugs": {
-    "url": "https://github.com/lennartschoch/pi-cache-compact/issues"
   },
   "publishConfig": {
     "access": "public"

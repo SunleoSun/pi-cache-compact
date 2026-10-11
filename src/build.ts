@@ -295,6 +295,52 @@ export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
  * First `limit` characters of a message's visible text, whitespace collapsed —
  * enough for a model to locate the message in its own context.
  */
+export const PRESERVE_DYNAMIC_COMPACTION_RATIO = 0.9
+export const PRESERVE_DYNAMIC_HEADROOM_MARGIN_TOKENS = 2048
+
+export type PreserveCompactionBudget = {
+  preservedTokens: number
+  availableTokens: number
+  occupiedTokens: number
+  thresholdTokens: number
+  pressure: number
+  shouldCompact: boolean
+}
+
+/**
+ * Decide when preserve-dialogue should compact proactively.
+ *
+ * Preserved user messages and visible assistant prose can never be reclaimed.
+ * Remove them and the summary headroom from the model window, then compact
+ * once 90% of that remaining budget is occupied.
+ */
+export function preserveCompactionBudget(args: {
+  contextTokens: number
+  contextWindow: number
+  preservedTokens: number
+  headroomTokens: number
+  ratio?: number
+}): PreserveCompactionBudget {
+  const contextWindow = Math.max(0, args.contextWindow)
+  const contextTokens = Math.max(0, args.contextTokens)
+  const preservedTokens = Math.min(Math.max(0, args.preservedTokens), contextWindow)
+  const headroomTokens = Math.max(0, args.headroomTokens)
+  const ratio = Math.min(1, Math.max(0, args.ratio ?? PRESERVE_DYNAMIC_COMPACTION_RATIO))
+  const availableTokens = Math.max(0, contextWindow - preservedTokens - headroomTokens)
+  const occupiedTokens = Math.max(0, contextTokens - preservedTokens)
+  const thresholdTokens = Math.floor(availableTokens * ratio)
+  const pressure = availableTokens > 0 ? occupiedTokens / availableTokens : Number.POSITIVE_INFINITY
+
+  return {
+    preservedTokens,
+    availableTokens,
+    occupiedTokens,
+    thresholdTokens,
+    pressure,
+    shouldCompact: occupiedTokens > 0 && occupiedTokens >= thresholdTokens,
+  }
+}
+
 export type SummaryRequestShape = "continuation" | "continuation-request" | "dropped"
 
 export type SummaryRequestPlan = {
@@ -313,6 +359,8 @@ export type SummaryRequestPlan = {
    * prefill, so the caller may prefer Pi's own small summary instead.
    */
   rewindFallback: boolean
+  /** Whether the chosen messages + ask + output budget fit the model window. */
+  requestFits: boolean
   /** Output ceiling for this request, resolved by `summaryOutputCap`. */
   maxTokens: number
   boundary?: SummaryBoundary
@@ -372,7 +420,9 @@ export function planSummaryRequest(args: {
   maxTokens?: number
   reserveTokens?: number
   modelMaxTokens?: number
-}): SummaryRequestPlan {
+  /** Tokens of state actually replaced by the new checkpoint, when narrower than droppedMessages. */
+  reclaimedTokens?: number
+  }): SummaryRequestPlan {
   // Resolve the output ceiling once, from Pi's rule bounded by what this
   // compaction reclaims, so the fit checks and the request agree on it.
   // One scale for every estimate in this decision, calibrated against the
@@ -382,7 +432,8 @@ export function planSummaryRequest(args: {
     configured: args.summaryMaxTokens ?? args.maxTokens,
     reserveTokens: args.reserveTokens,
     modelMaxTokens: args.modelMaxTokens,
-    droppedTokens: Math.ceil(estimateMessagesTokens(args.droppedMessages) * scale),
+    droppedTokens:
+    args.reclaimedTokens ?? Math.ceil(estimateMessagesTokens(args.droppedMessages) * scale),
   })
   const fits = (messages: readonly unknown[]): boolean =>
     continuationFits({
@@ -406,16 +457,22 @@ export function planSummaryRequest(args: {
   // older dialogue before Pi's native projected prefix.
   const requiredRequestCount = Math.max(0, args.liveMessages.length - keptCount)
   const candidates: { shape: SummaryRequestShape; messages: Message[] }[] = []
-  if (args.options.continuation !== false) {
-    if (args.liveMessages.length > droppedCount) {
-      candidates.push({ shape: "continuation", messages: args.liveMessages })
-    }
-    // `>=`, not `>`: when the compacted boundary is exactly the end of the
-    // last live request those bytes are still a forward continuation.
-    if (args.requestMessages.length >= requiredRequestCount && args.requestMessages.length > 0) {
-      candidates.push({ shape: "continuation-request", messages: args.requestMessages })
-    }
+if (args.options.continuation !== false) {
+  const wholeLiveIsScope = args.options.preserveDialogue === true
+  if (args.liveMessages.length > 0 && (wholeLiveIsScope || args.liveMessages.length > droppedCount)) {
+    candidates.push({ shape: "continuation", messages: args.liveMessages })
   }
+  // Preserve mode summarizes every tool interaction that exists at compaction
+  // time. A shorter last-request continuation can omit fresh tool results that
+  // arrived after that request, so it is not a valid preserve-mode shape.
+  if (
+    !wholeLiveIsScope &&
+    args.requestMessages.length >= requiredRequestCount &&
+    args.requestMessages.length > 0
+  ) {
+    candidates.push({ shape: "continuation-request", messages: args.requestMessages })
+  }
+}
   candidates.push({ shape: "dropped", messages: args.droppedMessages })
 
   const chosen =
@@ -423,6 +480,7 @@ export function planSummaryRequest(args: {
     candidates.find((candidate) => fits(candidate.messages)) ??
     candidates[0]
   const rewindFallback = chosen.shape === "dropped" && args.options.continuation !== false
+const requestFits = fits(chosen.messages)
 
   const boundaryFor = (messages: readonly unknown[]): SummaryBoundary | undefined => {
     const last = messages[messages.length - 1]
@@ -439,7 +497,12 @@ export function planSummaryRequest(args: {
   // The scope note only matters when the request also carries messages the
   // model may not summarize: nothing is retained when the shape is `dropped`
   // (a rewind) or when the conversation kept no tail at all.
-  const boundary = chosen.shape !== "dropped" && keptCount > 0 ? boundaryFor(args.droppedMessages) : undefined
+  const boundary =
+args.options.preserveDialogue === true
+? undefined
+: chosen.shape !== "dropped" && keptCount > 0
+? boundaryFor(args.droppedMessages)
+: undefined
 
   let split: SummaryRequestPlan["split"]
   const turnPrefixCount = args.turnPrefixCount ?? 0
@@ -459,6 +522,7 @@ export function planSummaryRequest(args: {
     droppedMessages: args.droppedMessages,
     maxTokens,
     rewindFallback,
+    requestFits,
     ask: renderSummaryAsk({
       summaryPrompt: args.options.summaryPrompt,
       preserveDialogue: args.options.preserveDialogue,
@@ -930,6 +994,36 @@ export function computeFileLists(fileOps: FileOperationsLike | undefined): {
   const modified = new Set<string>([...(fileOps?.edited ?? []), ...(fileOps?.written ?? [])])
   const readFiles = [...(fileOps?.read ?? [])].filter((file) => !modified.has(file)).sort()
   return { readFiles, modifiedFiles: [...modified].sort() }
+}
+
+/**
+ * File appendix state for preserve mode, which summarizes every tool call that
+ * exists at compaction time rather than Pi's native keepRecentTokens cut.
+ */
+export function computeFileListsFromMessages(
+  messages: readonly { role?: string; content?: unknown }[],
+  previous?: { readFiles?: readonly string[]; modifiedFiles?: readonly string[] },
+): { readFiles: string[]; modifiedFiles: string[] } {
+  const read = new Set<string>(previous?.readFiles ?? [])
+  const modified = new Set<string>(previous?.modifiedFiles ?? [])
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      if (typeof block !== "object" || block === null) continue
+      const tool = block as { type?: unknown; name?: unknown; arguments?: unknown }
+      if (tool.type !== "toolCall" || typeof tool.name !== "string") continue
+      if (typeof tool.arguments !== "object" || tool.arguments === null) continue
+      const path = (tool.arguments as { path?: unknown }).path
+      if (typeof path !== "string" || path.length === 0) continue
+      if (tool.name === "read") {
+        if (!modified.has(path)) read.add(path)
+      } else if (tool.name === "write" || tool.name === "edit") {
+        modified.add(path)
+        read.delete(path)
+      }
+    }
+  }
+  return { readFiles: [...read].sort(), modifiedFiles: [...modified].sort() }
 }
 
 /**

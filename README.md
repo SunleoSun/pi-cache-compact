@@ -12,7 +12,7 @@ For locally hosted models, where prefilling a large context is the expensive par
 [Install](#install) · [Configure](#configure) · [How it works](#how-it-works) · [Caveats](#caveats) · [Develop](#develop)
 
 [![npm](https://img.shields.io/npm/v/pi-cache-compact-preserved-messages?color=8B5CF6&style=flat-square)](https://www.npmjs.com/package/pi-cache-compact-preserved-messages)
-![tests](https://img.shields.io/badge/tests-79-brightgreen)
+![tests](https://img.shields.io/badge/tests-104-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 </div>
@@ -34,8 +34,8 @@ message. Two consequences:
    message. For a coding session, the tool output *is* the substance: file
    contents, diffs, test failures, error text.
 
-This extension leaves Pi's trigger and cut alone and replaces only the
-summarization call:
+This extension makes compaction cache-friendly while preserving Pi's emergency
+threshold and overflow recovery:
 
 1. **Reuse the live prefix.** It asks for the handoff summary as a strict
    continuation of the conversation — the same system prompt, the same tool
@@ -46,10 +46,12 @@ summarization call:
    precisely because its request is cold. A continuation is a cache hit, so the
    prompt costs almost nothing to make large: the summary is written from the
    real messages, at full fidelity, and the only tokens evaluated are the ask.
-3. **Let Pi do the rest.** Pi still decides when to compact, still keeps the
-   recent tail, and still appends the compaction entry.
-4. **Fail safe.** If the summary comes back empty, truncated, or as a tool call,
-   the extension returns nothing and Pi's default summary runs instead.
+3. **Compact preserve mode at safe turn boundaries.** After a tool-using turn
+   has fully persisted its results and before the next provider request, the
+   extension can write the preserve compaction boundary without aborting the run.
+4. **Fail closed in preserve mode.** If a complete tool-state summary cannot be
+   produced safely, the compaction is cancelled rather than losing verbatim
+   dialogue. With `preserveDialogue: false`, Pi's normal fallback remains available.
 
 **The shape is the whole trick.** Sending only the span Pi is about to drop
 *looks* right — it is a prefix of the live request — but on an append-only cache
@@ -88,8 +90,8 @@ Options are read from JSON, merged with the project file winning:
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | Disable the extension entirely. |
-| `models` | string[] | `[]` (all) | Only act on these `provider/modelId`s. Scope it to your local endpoint. |
+| `enabled` | boolean | `true` | Disable the extension entirely, including preserve-mode context restoration and UI diagnostics. |
+| `models` | string[] | `[]` (all) | Only run compaction handling and diagnostics on these `provider/modelId`s. Scope it to your local endpoint. |
 | `summaryModel` | `{ provider, id }` | active model | Summarize with a different (e.g. cheaper) model. |
 | `summaryPrompt` | string | [see `src/build.ts`](src/build.ts) | Replace the handoff instruction. In `preserveDialogue` mode a custom prompt is responsible for keeping the summary tool-only. |
 | `preserveDialogue` | boolean | `true` | Keep every historical user message and visible assistant text response verbatim in future model context. Old tool results and tool calls are replaced by the generated technical summary; old thinking/reasoning is discarded rather than summarized. |
@@ -97,22 +99,31 @@ Options are read from JSON, merged with the project file winning:
 | `summaryReasoningEffort` | `"off" \| "none" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | mirror the live request | Force an effort. The default mirrors what the last live request actually sent, because the effort reaches the prompt on some servers (see Caveats). `"none"` sends `reasoning_effort: "none"`, which llama.cpp documents as disabling reasoning *without* handing the value to the chat template; `"off"` sends no field at all, leaving the server's default. Either is worth trying if a reasoning model keeps ending its turn inside its reasoning block. |
 | `cacheRetention` | `"none" \| "short" \| "long"` | `"short"` | Cache retention for the summary request. |
 | `toolChoice` | `"none" \| "auto"` | `"none"` | Forbid tool calls in the summary reply; tools are still declared for the prefix. |
-| `deferAfterCacheMiss` | boolean | `true` | After a continuation reads nothing from the cache (the server dropped the conversation), leave the next compaction to Pi's small truncated summary instead of paying a full cold prefill of the whole conversation. Re-arms after 15 minutes. |
-| `continuation` | boolean | `true` | Send the ask as a forward continuation of the live conversation (`continuation`, or `continuation-request` when the whole projection no longer fits the window) instead of a rewind to the dropped span. On append-only caches (llama.cpp slots) a rewind re-prefills everything. `false` sends only the dropped span. |
-| `rewindWhenNeeded` | boolean | `false` | When no continuation fits the context window, send the rewinding shape (the dropped span alone) instead of leaving that compaction to Pi. Off by default: a rewind never reused a cache in any measurement and costs a whole cold prefill, while Pi's own summary is a small prompt. Enable it on a server that caches arbitrary shared prefixes. |
+| `deferAfterCacheMiss` | boolean | `true` | After a large continuation misses the cache, avoid immediately paying another cold full-prefix request. Normal mode can defer to Pi's small summary; preserve mode cancels rather than accepting Pi's lossy fallback. Re-arms after 15 minutes. |
+| `continuation` | boolean | `true` | Send the ask as a forward continuation of the live conversation instead of a rewind to the dropped span. Normal mode may use `continuation-request` when the whole projection no longer fits. Preserve mode must cover all current tool traffic, so it requires the complete live continuation and cancels rather than silently omitting fresh tool results. `false` sends only the dropped span. |
+| `rewindWhenNeeded` | boolean | `false` | When no continuation fits the context window, allow the rewinding dropped-span shape. In preserve mode this does not relax the requirement to cover all current tool traffic. Off by default because a rewind never reused a cache in measurements and costs a cold prefill. |
 | `debug` | boolean | `false` | Log decisions to stderr. |
 | `debugFile` | string | — | With `debug`, also append structured JSONL records (request fingerprints, request/response headers redacted, summary lifecycle) to this file. |
 | `debugPayloads` | boolean | `false` | With `debug` + `debugFile`, dump the full request payloads around a compaction. **Contains the whole conversation** — keep the file private. |
 
 ## How it works
 
-Pi computes the context size from the last reported usage and compacts when it
-crosses `contextWindow - reserveTokens`. That fires `session_before_compact`,
-where an extension can supply its own summary.
+Pi still has its native emergency threshold at
+`contextWindow - reserveTokens`, but preserve-dialogue mode no longer relies on
+that fixed reserve for normal timing. At each `turn_end` boundary — after the
+assistant message and all tool results for the turn have been persisted, and
+before the next provider request — the extension measures the user messages and
+visible assistant prose that survive every future compaction, subtracts that
+permanent dialogue plus summary headroom from the model window, and compacts
+when everything else occupies at least **90%** of the remaining usable budget.
+This keeps long tool-using runs from overshooting the context before the agent
+settles.
 
-The extension appends one user turn — the ask — to the live conversation and
-calls `ctx.modelRegistry.complete(...)`; Pi persists the returned summary as a
-normal `CompactionEntry` while keeping its own tail.
+Normal preserve compaction is written directly as a Pi boundary compaction, so
+the active agent run continues to its next turn; calling `ctx.compact()` at that
+point would abort the run. Pi's native threshold and overflow recovery still
+flow through `session_before_compact` as emergency fallbacks for a single turn
+that grows past the safe boundary before `turn_end`.
 
 *Forward* rather than *"a prefix of the live prompt"* is the part that took
 measurement to get right. The obvious shape — send only the span Pi is about to
@@ -124,18 +135,15 @@ re-prefilled all 7710 tokens, while a continuation of it reused 7706/7745 in
 largest first, and only among shapes that fit the context window:
 
 - `continuation` — the whole projection. Extends the checkpoint *including* the
-  reply the server generated, so it is the safest cache bet.
-- `continuation-request` — the messages of the last live request, which is the
-  exact prompt sitting in the server's cache. This is the shape that fits when a
-  large tool result arrives and pushes the conversation over the compaction
-  threshold: Pi compacts because of that output, and including it (plus the
-  output budget) no longer fits the window.
-- `dropped` — the rewind. Only used when `continuation: false` asks for it, or
-  when `rewindWhenNeeded: true` and nothing else fits. Otherwise a compaction
-  where only the rewind fits is **left to Pi**: the rewind has never reused a
-  cache in any measurement and costs the whole conversation as a cold prefill,
-  which is worse than Pi's own small (truncated) prompt. Same rule after a
-  measured miss, via `deferAfterCacheMiss`.
+  reply the server generated, so it is the safest cache bet and the required
+  preserve-mode shape because it contains every current tool call/result.
+- `continuation-request` — the messages of the last live request. This shorter
+  forward continuation can be used only outside preserve mode; it may omit tool
+  results that arrived after that request, so it cannot satisfy preserve mode's
+  all-tool-state invariant.
+- `dropped` — the rewind. Only used when the selected mode permits it. On
+  append-only caches it has never reused the checkpoint and therefore costs a
+  cold prefill.
 
 Mirroring goes beyond the body: the ask replays the request headers the last
 live request sent (minus transport-managed ones and `null` deletions), so
@@ -151,12 +159,12 @@ token guess), and the reported part itself is exact. Without that, blob-heavy
 transcripts came out ~3x high — enough to refuse a shape that would have fitted
 and to make the reclaimed-size ceiling inert.
 
-The summary *text* is still scoped to what compaction drops: Pi keeps
-`keepRecentTokens` verbatim, so a summary that also covered the kept tail would
-describe those messages twice and `summary + kept tail` could exceed what it
-replaced. With the continuation shape that scope comes from a note in the ask
-(which names the boundary message), not from truncating the request — that is
-the whole trick.
+With `preserveDialogue: false`, summary scope still follows Pi's native
+`firstKeptEntryId` / `keepRecentTokens` cut. Preserve mode is different:
+**every tool call/result that exists when compaction runs belongs to the new
+technical summary**, while every user message and visible assistant response is
+restored verbatim. No pre-compaction tool tail remains raw merely because Pi's
+native projection would have kept it.
 
 The e2e test proves this from the recorded HTTP bodies: the summary request keeps
 the conversation's system prompt, declares the same tools, and the previous live
@@ -173,18 +181,35 @@ By default, `preserveDialogue` is `true`, so a fresh install needs no extra conf
    User messages and visible assistant prose are explicitly excluded from that
    summary.
 2. A `context` hook rebuilds every later model request from Pi's append-only
-   raw session branch. All historical user messages and visible assistant text
-   blocks before the latest compaction cut are restored verbatim; old thinking,
-   tool-call blocks, and tool results stay removed. The technical checkpoint is
-   inserted once between that restored dialogue and Pi's retained recent tail.
+raw session branch. All user messages and visible assistant text that existed
+when the latest compaction ran are restored verbatim; every tool call/result and
+all assistant reasoning from that same pre-compaction state stay removed. The
+technical checkpoint is inserted after that preserved dialogue. Only messages
+created **after** the compaction remain raw until the next compaction.
 
 The compaction entry carries a versioned marker in `details`, so this behavior
 survives Pi restarts and repeated compactions. Append-only `context_edit`
-entries are honored when old dialogue is restored. This mode also fails closed:
-if a safe technical summary cannot be produced (for example the cache is gone,
-the reply is unusable, or only a disallowed rewind fits), the extension cancels
-that compaction instead of letting Pi replace the preserved dialogue with its
-normal lossy summary.
+entries are honored when old dialogue is restored.
+
+The proactive trigger uses the same preservation rule as restoration itself:
+all user messages and visible assistant text are the permanent, non-compressible
+part. At each tool-bearing `turn_end`, the remaining context budget is
+recalculated with the exact summary-output headroom removed first; compaction
+starts at **90%** occupancy of that remaining budget. Pi's fixed
+`reserveTokens` threshold remains the emergency fallback if a single tool turn
+overshoots before that boundary.
+
+In interactive Pi, every preserve-mode compaction reports which path triggered
+it (`normal (dynamic 90%)`, `emergency (Pi threshold)`, `overflow recovery`, or
+`manual /compact`), the estimated token split between preserved and compactable
+messages, and the full current context usage. After a successful compaction it
+also displays the resulting tools/results technical checkpoint. These UI
+notifications are diagnostic only and are never allowed to affect compaction.
+
+This mode also fails closed: if a safe technical summary cannot be produced
+(for example the cache is gone, the reply is unusable, or only a disallowed
+rewind fits), the extension cancels that compaction instead of letting Pi
+replace the preserved dialogue with its normal lossy summary.
 
 This mode intentionally does **not** compress dialogue. If user prompts plus
 assistant prose alone grow close to the model's context limit, no tool-output
@@ -197,9 +222,9 @@ Run `npm run certify` to execute typecheck, the full unit suite, and the real-Pi
 end-to-end suite. The preserve-dialogue e2e test resumes one persisted session
 across multiple Pi processes and repeated compactions, then verifies exact
 user/assistant dialogue restoration, a single technical summary, strict
-cache-prefix continuation, and removal of tool traffic that is behind the
-compaction cut. The newest tool interaction may still remain in Pi's normal
-recent tail.
+cache-prefix continuation, and removal of every tool call/result that existed
+when each preserve compaction ran. Tool traffic created after the latest
+compaction remains raw until the next one.
 
 ### What the summary contains
 
@@ -241,12 +266,12 @@ characters.
   compaction cannot create useful headroom. Preserve mode cancels compaction
   rather than falling back to Pi's lossy summary, so a fresh session is the
   escape hatch once preserved dialogue itself is too large.
-- How much context compaction reclaims is Pi's `keepRecentTokens` setting: it
-  keeps that many recent tokens verbatim. If it is close to (or larger than)
-  `contextWindow - reserveTokens`, Pi drops little and compaction barely helps —
-  lower it for small-context local models. Set it well below `contextWindow -
-  reserveTokens` and each compaction replaces the dropped span with a short
-  summary.
+- In `preserveDialogue` mode, `keepRecentTokens` is **not** a preservation
+policy. Pi still uses it internally while preparing its native compaction entry,
+but the context hook does not replay that pre-compaction tail: old tool
+calls/results are summarized regardless of the native cut, and old
+user/assistant prose is restored independently. Do not tune
+`keepRecentTokens` to retain tool history in preserve mode.
 - `toolChoice: "none"` is ignored by some providers; if the model calls a tool
   anyway the reply is rejected and Pi's default summary runs.
 - The fit estimates are calibrated against one reported prompt size, which
