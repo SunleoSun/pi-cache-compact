@@ -117,7 +117,7 @@ preserveDialogue?: boolean
    * the full prefill again. Set false to always try the continuation.
    */
   deferAfterCacheMiss?: boolean
-  /** Verbose logging to stderr. Default false. */
+  /** Master debug switch. Default false; when false, debugFile is never created or touched. */
   debug?: boolean
   /**
    * JSONL file that structured debug records are appended to (requires

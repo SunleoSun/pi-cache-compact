@@ -7,10 +7,10 @@
  * never reuse the KV cache, so the whole conversation is re-prefilled just to
  * produce the summary — the expensive part you were trying to avoid.
  *
- * In preserve-dialogue mode the extension also owns normal compaction timing:
- * at safe `turn_end` boundaries it checks pressure and, when needed, writes a
- * preserve compaction boundary before the next provider request. Emergency
- * threshold/overflow compaction still enters through `session_before_compact`.
+ * In preserve-dialogue mode the extension also owns normal checkpoint timing:
+ * at safe `turn_end` boundaries it checks pressure and, when needed, writes
+ * context edits plus a hidden checkpoint before the next provider request.
+ * Pi threshold/overflow compaction still enters through `session_before_compact`.
  *
  * The summary itself is asked as a strict continuation of the live conversation
  * (same system prompt, same tools, same messages, one appended user turn), so a
@@ -20,7 +20,7 @@
 
 import { join } from "node:path"
 
-import { CONFIG_DIR_NAME, convertToLlm, getAgentDir } from "@earendil-works/pi-coding-agent"
+import { CONFIG_DIR_NAME, DEFAULT_COMPACTION_SETTINGS, SettingsManager, convertToLlm, getAgentDir } from "@earendil-works/pi-coding-agent"
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -58,11 +58,28 @@ computeFileListsFromMessages,
   type SummaryRequestShape,
 } from "./build.ts"
 import { readOptions, type CacheCompactOptions } from "./config.ts"
-import { DebugLogger, fingerprintPayload, redactHeaders, shortHash, snapshot } from "./debug.ts"
 import {
+DebugLogger,
+fingerprintPayload,
+redactHeaders,
+rollingMessageHashes,
+sharedPrefixLength,
+shortHash,
+snapshot,
+} from "./debug.ts"
+import {
+PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
 PRESERVE_DIALOGUE_MARKER,
 isPreserveDialogueCompaction,
+latestPreserveDialogueState,
+preserveDeltaScope,
+preserveDialogueBoundaryEntries,
+preserveDialogueDeltaMessages,
+preserveDialogueStates,
+preservedCheckpointMessages,
+preservedContextMessages,
 preservedDialogueMessages,
+previewPreservedContextAfterCheckpoint,
 rebuildPreservedDialogue,
 type CacheCompactDetails,
 } from "./preserve.ts"
@@ -129,16 +146,26 @@ function effectiveAgentMessages(
     : [...projectedAgent]
 }
 
-type CompactionBranch = "normal (dynamic 90%)" | "emergency (Pi threshold)" | "overflow recovery" | "manual /compact"
+type CompactionBranch = "normal (dynamic 90%)" | "normal (before Pi threshold)" | "emergency (Pi threshold)" | "overflow recovery" | "manual /compact"
 
 function compactionBranch(
-  reason: "manual" | "threshold" | "overflow",
-  dynamic: boolean,
+reason: "manual" | "threshold" | "overflow",
+dynamic: CompactionBranch | undefined,
 ): CompactionBranch {
-  if (dynamic) return "normal (dynamic 90%)"
-  if (reason === "threshold") return "emergency (Pi threshold)"
-  if (reason === "overflow") return "overflow recovery"
-  return "manual /compact"
+if (dynamic) return dynamic
+if (reason === "threshold") return "emergency (Pi threshold)"
+if (reason === "overflow") return "overflow recovery"
+return "manual /compact"
+}
+
+function piCompactionSettings(ctx: ExtensionContext, model: Model<Api>) {
+try {
+return SettingsManager.create(ctx.cwd, getAgentDir(), {
+projectTrusted: ctx.isProjectTrusted(),
+}).getCompactionSettings(model)
+} catch {
+return DEFAULT_COMPACTION_SETTINGS
+}
 }
 
 function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
@@ -152,9 +179,17 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
 
 type CompactionTokenBreakdown = {
 preserved: number
-oldSummary: number
+preservedDialogue: number
+preservedUserMessages: number
+preservedAssistantText: number
+historicalCheckpoints: number
+checkpointCount: number
 newRawCompactable: number
 compactable: number
+rawToolCalls: number
+rawToolResults: number
+rawReasoning: number
+rawOther: number
 nonSystemTotal: number
 scale: number
 }
@@ -171,24 +206,162 @@ branchEntries,
 const liveMessages = convertToLlm(effectiveAgent)
 const scale = tokenScale(liveMessages)
 const nonSystemMessages = liveMessages.filter((message) => message.role !== "system")
-const preservedMessages = convertToLlm(preservedDialogueMessages(branchEntries))
-const oldSummaryMessages = convertToLlm(
-effectiveAgent.filter((message) => message.role === "compactionSummary"),
-)
+const estimate = (messages: readonly AgentMessage[]): number =>
+Math.ceil(estimateMessagesTokens(convertToLlm([...messages])) * scale)
+
+const dialogueMessages = preservedDialogueMessages(branchEntries)
+const checkpointMessages = preservedCheckpointMessages(branchEntries)
+const preservedUserMessages = estimate(dialogueMessages.filter((message) => message.role === "user"))
+const preservedAssistantText = estimate(dialogueMessages.filter((message) => message.role === "assistant"))
+const preservedDialogue = estimate(dialogueMessages)
+const historicalCheckpoints = estimate(checkpointMessages)
+const preserved = preservedDialogue + historicalCheckpoints
 const nonSystemTotal = Math.ceil(estimateMessagesTokens(nonSystemMessages) * scale)
-const preserved = Math.ceil(estimateMessagesTokens(preservedMessages) * scale)
-const oldSummary = Math.ceil(estimateMessagesTokens(oldSummaryMessages) * scale)
-const compactable = Math.max(0, nonSystemTotal - preserved)
+const newRawCompactable = Math.max(0, nonSystemTotal - preserved)
+
+const toolResults = effectiveAgent.filter((message) => message.role === "toolResult")
+const assistantSubset = (type: "toolCall" | "thinking"): AgentMessage[] =>
+effectiveAgent.flatMap((message) => {
+if (message.role !== "assistant" || !Array.isArray(message.content)) return []
+const content = message.content.filter((block) => block.type === type)
+return content.length > 0 ? [{ ...message, content } as AgentMessage] : []
+})
+const rawToolResults = Math.min(newRawCompactable, estimate(toolResults))
+const rawToolCalls = Math.min(newRawCompactable, estimate(assistantSubset("toolCall")))
+const rawReasoning = Math.min(newRawCompactable, estimate(assistantSubset("thinking")))
+const classified = Math.min(newRawCompactable, rawToolResults + rawToolCalls + rawReasoning)
+
 return {
 preserved,
-oldSummary: Math.min(oldSummary, compactable),
-newRawCompactable: Math.max(0, compactable - oldSummary),
-compactable,
+preservedDialogue,
+preservedUserMessages,
+preservedAssistantText,
+historicalCheckpoints,
+checkpointCount: preserveDialogueStates(branchEntries).length,
+newRawCompactable,
+compactable: newRawCompactable,
+rawToolCalls,
+rawToolResults,
+rawReasoning,
+rawOther: Math.max(0, newRawCompactable - classified),
 nonSystemTotal,
 scale,
 }
 }
 
+function debugMessageKind(message: unknown): string {
+const record = message && typeof message === "object" ? message as Record<string, unknown> : {}
+const role = typeof record.role === "string" ? record.role : "unknown"
+if (role !== "assistant") return role
+const content = Array.isArray(record.content) ? record.content : []
+const types = content
+.map((block) => block && typeof block === "object" ? String((block as Record<string, unknown>).type ?? "") : "")
+.filter(Boolean)
+if (types.includes("toolCall")) return types.includes("text") ? "assistant-visible+tool-call" : "assistant-tool-call"
+if (types.includes("thinking")) return types.includes("text") ? "assistant-visible+reasoning" : "assistant-reasoning"
+return "assistant-visible"
+}
+
+function debugContextIndex(
+messages: readonly unknown[],
+scale: number,
+branchEntries: readonly SessionEntry[] = [],
+syntheticCheckpoint?: { number: number; summary: string },
+): Array<Record<string, unknown>> {
+const usedEntryIds = new Set<string>()
+const checkpointCandidates = preserveDialogueStates(branchEntries).map((state, index) => ({
+number: state.details?.checkpoint?.number ?? index + 1,
+summary: state.summary,
+sourceEntryId:
+"id" in state.entry && typeof state.entry.id === "string" ? state.entry.id : null,
+}))
+if (syntheticCheckpoint) {
+checkpointCandidates.push({
+number: syntheticCheckpoint.number,
+summary: syntheticCheckpoint.summary,
+sourceEntryId: null,
+})
+}
+
+const ignoredAnchors = new Set([
+"user",
+"assistant",
+"toolResult",
+"custom",
+"text",
+"thinking",
+"toolCall",
+])
+const stringAnchors = (value: unknown, out: string[] = []): string[] => {
+if (typeof value === "string") {
+const trimmed = value.trim()
+if (trimmed.length >= 3 && !ignoredAnchors.has(trimmed)) out.push(trimmed)
+return out
+}
+if (Array.isArray(value)) {
+for (const item of value) stringAnchors(item, out)
+return out
+}
+if (value && typeof value === "object") {
+for (const item of Object.values(value as Record<string, unknown>)) stringAnchors(item, out)
+}
+return out
+}
+const providerRole = (message: unknown): string =>
+String((message as { role?: unknown } | undefined)?.role ?? "")
+const compatibleRole = (wireRole: string, entryRole: string): boolean => {
+if (wireRole === "assistant") return entryRole === "assistant"
+if (wireRole === "tool" || wireRole === "toolResult") return entryRole === "toolResult"
+if (wireRole === "user") return entryRole === "user" || entryRole === "custom"
+if (wireRole === "system" || wireRole === "developer") return false
+return wireRole === entryRole
+}
+
+return messages.map((message, index) => {
+const record = message && typeof message === "object" ? message as Record<string, unknown> : {}
+const estimatedTokens = Math.ceil(
+estimateMessagesTokens([message] as unknown as Parameters<typeof estimateMessagesTokens>[0]) * scale,
+)
+const serialized = JSON.stringify(message)
+const checkpoint = checkpointCandidates.find((candidate) => {
+if (candidate.summary.length === 0) return false
+const escapedSummary = JSON.stringify(candidate.summary).slice(1, -1)
+return serialized.includes(escapedSummary)
+})
+let sourceEntryId: string | null = checkpoint?.sourceEntryId ?? null
+let checkpointNumber: number | null = checkpoint?.number ?? null
+
+if (!checkpoint) {
+const wireRole = providerRole(message)
+let bestEntry: Extract<SessionEntry, { type: "message" }> | undefined
+let bestScore = -1
+for (const entry of branchEntries) {
+if (entry.type !== "message" || usedEntryIds.has(entry.id)) continue
+if (!compatibleRole(wireRole, entry.message.role)) continue
+const matchedAnchors = stringAnchors(entry.message).filter((anchor) => serialized.includes(anchor))
+if (matchedAnchors.length === 0) continue
+const score = matchedAnchors.length * 1000 + matchedAnchors.reduce((sum, anchor) => sum + anchor.length, 0)
+if (score <= bestScore) continue
+bestScore = score
+bestEntry = entry
+}
+if (bestEntry) {
+sourceEntryId = bestEntry.id
+usedEntryIds.add(bestEntry.id)
+}
+}
+
+return {
+index,
+role: typeof record.role === "string" ? record.role : "unknown",
+kind: debugMessageKind(message),
+sourceEntryId,
+checkpointNumber,
+estimatedTokens,
+hash: shortHash(message),
+}
+})
+}
 /** Summarize with `summaryModel` when configured and resolvable, else the active model. */
 function resolveSummarizer(
   ctx: ExtensionContext,
@@ -321,6 +494,10 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   const recentLivePayloads: { sessionId: string; payload: unknown }[] = []
   // Sessions whose next live request should be dumped as `live_after`.
   const dumpNextLive = new Set<string>()
+  const pendingPostCompactionContext = new Map<
+  string,
+  { checkpointNumber: number; beforePayload?: unknown }
+  >()
 
   // Last live request headers, per session, as captured by
   // `before_provider_headers`. The summary ask replays them (see
@@ -349,71 +526,99 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   // — far more so than Pi's little truncated prompt. See `deferAfterCacheMiss`.
   const lastSummaryOutcome = new Map<string, { at: number; missed: boolean }>()
 
-// Preserve-aware boundary compactions are asynchronous. Keep one in flight
+// Preserve-aware boundary checkpoints are asynchronous. Keep one in flight
 // per session so no overlapping boundary work can race the same branch.
-const dynamicCompactions = new Set<string>()
+const dynamicCompactions = new Map<string, CompactionBranch>()
 
 type PendingCompactionUi = {
-  branch: CompactionBranch
-  tokens: CompactionTokenBreakdown
-  contextTokens?: number
-  contextWindow?: number
+branch: CompactionBranch
+tokens: CompactionTokenBreakdown
+scope: ReturnType<typeof preserveDeltaScope>
+contextTokens?: number
+contextWindow?: number
 }
 const pendingCompactionUi = new Map<string, PendingCompactionUi>()
 const compactionFailureReasons = new Map<string, string>()
 
 const reportCompactionComplete = (
-ctx: ExtensionContext,
-fallbackBranch: CompactionBranch,
-summary: string,
-tokensBefore: number,
+  ctx: ExtensionContext,
+  fallbackBranch: CompactionBranch,
+  summary: string,
+  tokensBefore: number,
 ): void => {
-const sessionId = ctx.sessionManager.getSessionId()
-const pending = pendingCompactionUi.get(sessionId)
-pendingCompactionUi.delete(sessionId)
-compactionFailureReasons.delete(sessionId)
-const branch = pending?.branch ?? fallbackBranch
+  const sessionId = ctx.sessionManager.getSessionId()
+  const pending = pendingCompactionUi.get(sessionId)
+  pendingCompactionUi.delete(sessionId)
+  compactionFailureReasons.delete(sessionId)
+  const branch = pending?.branch ?? fallbackBranch
 
-let metrics = ""
-if (pending) {
-const summaryMessage = {
-role: "compactionSummary",
-summary,
-tokensBefore,
-timestamp: Date.now(),
-} as AgentMessage
-const summarySize = Math.ceil(
-estimateMessagesTokens(convertToLlm([summaryMessage])) * pending.tokens.scale,
-)
-const compressed = Math.max(0, pending.tokens.compactable - summarySize)
-const compression =
-summarySize > 0 ? (pending.tokens.compactable / summarySize).toFixed(1) : "∞"
-const overhead =
-pending.contextTokens === undefined
-? undefined
-: Math.max(0, pending.contextTokens - pending.tokens.nonSystemTotal)
-const totalNew = pending.tokens.preserved + summarySize + (overhead ?? 0)
-metrics = [
-`old summary: ${pending.tokens.oldSummary} tok`,
-`new raw compactable state: ${pending.tokens.newRawCompactable} tok`,
-`total compacted state: ${pending.tokens.compactable} tok`,
-"",
-`summary size: ${summarySize} tok`,
-`compressed: ${compressed} tok`,
-`compression: ${compression}x`,
-"",
-`preserved messages: ${pending.tokens.preserved} tok`,
-...(overhead === undefined ? [] : [`system/tools overhead: ~${overhead} tok`]),
-`total new context: ~${totalNew} tok`,
-"",
-].join("\n")
-}
+  let metrics = ""
+  if (pending) {
+    const checkpointMessage = {
+      role: "custom",
+      customType: PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
+      content: `## Tool Context Checkpoint #${pending.scope.nextCheckpointNumber}\n\n${summary}`,
+      display: false,
+      timestamp: Date.now(),
+    } as AgentMessage
+    const checkpointSize = Math.ceil(
+      estimateMessagesTokens(convertToLlm([checkpointMessage])) * pending.tokens.scale,
+    )
+    const reclaimed = Math.max(0, pending.tokens.newRawCompactable - checkpointSize)
+    const compression =
+      checkpointSize > 0 ? (pending.tokens.newRawCompactable / checkpointSize).toFixed(1) : "∞"
 
-notify(
-ctx,
-`[cache-compact] compact complete: ${branch}\n${metrics}tools/results summary:\n${summary.trim() || "(empty)"}`,
-"info",
-)
+    const projectionMessages = ctx.sessionManager.buildSessionProjection().messages as AgentMessage[]
+    const providerMessages = convertToLlm(projectionMessages)
+    const systemPromptTokens = Math.ceil(
+      estimateMessagesTokens(providerMessages.filter((message) => message.role === "system")) * pending.tokens.scale,
+    )
+    const lastLive = [...recentLivePayloads].reverse().find((entry) => entry.sessionId === sessionId)
+    const lastLivePayload = (lastLive?.payload ?? {}) as { tools?: unknown }
+    const toolDeclarations = Array.isArray(lastLivePayload.tools)
+      ? lastLivePayload.tools
+      : activeToolDeclarations(pi.getAllTools(), pi.getActiveTools())
+    const toolDeclarationTokens = Math.ceil(
+      estimateMessagesTokens(toolDeclarations) * pending.tokens.scale,
+    )
+    const providerOverhead = Math.max(0, tokensBefore - pending.tokens.nonSystemTotal)
+    const otherProviderOverhead = Math.max(
+      0,
+      providerOverhead - systemPromptTokens - toolDeclarationTokens,
+    )
+    const totalNew = pending.tokens.preserved + checkpointSize + providerOverhead
+    const covered = pending.scope.coveredUserMessages.length > 0
+      ? pending.scope.coveredUserMessages.join(", ")
+      : "(none)"
+    metrics = [
+      `context before: ${tokensBefore} tok`,
+      `context after: ~${totalNew} tok`,
+      `reclaimed: ~${reclaimed} tok`,
+      "",
+      `preserved dialogue: ${pending.tokens.preservedDialogue} tok`,
+      ` user messages: ~${pending.tokens.preservedUserMessages} tok`,
+      ` assistant text: ~${pending.tokens.preservedAssistantText} tok`,
+      `historical checkpoints: ${pending.tokens.historicalCheckpoints} tok (${pending.tokens.checkpointCount})`,
+      `new raw compactable: ${pending.tokens.newRawCompactable} tok`,
+      ` tool calls: ~${pending.tokens.rawToolCalls} tok`,
+      ` tool results: ~${pending.tokens.rawToolResults} tok`,
+      ` reasoning: ~${pending.tokens.rawReasoning} tok`,
+      ` other: ~${pending.tokens.rawOther} tok`,
+      `new checkpoint #${pending.scope.nextCheckpointNumber}: ${checkpointSize} tok`,
+      `system prompt: ~${systemPromptTokens} tok`,
+      `tool declarations: ~${toolDeclarationTokens} tok`,
+      `other provider overhead: ~${otherProviderOverhead} tok`,
+      `checkpoint user messages: ${covered}`,
+      `compression: ${compression}x`,
+      "",
+    ].join("\n")
+  }
+
+  notify(
+    ctx,
+    `[cache-compact] compact complete: ${branch}\n${metrics}tools/results summary:\n${summary.trim() || "(empty)"}`,
+    "info",
+  )
 }
 
 const reportCompactionFailure = (
@@ -450,20 +655,25 @@ aborted ? "warning" : "error",
   ) return undefined
   try {
   const messages = rebuildPreservedDialogue(event.messages, ctx.sessionManager.getBranch())
-      return messages ? { messages } : undefined
-    } catch {
-      // Context restoration must never break a request. Without a usable
-      // marker/boundary Pi's native compacted projection remains valid.
-      return undefined
-    }
+  return messages ? { messages } : undefined
+  } catch (error) {
+  // Context restoration must never break a request. Without a usable
+  // marker/boundary Pi's native compacted projection remains valid, but make
+  // the failure diagnosable because falling back here breaks preserve semantics.
+  loggerFor(options).record("context_rebuild_failed", {
+  sessionId: ctx.sessionManager.getSessionId(),
+  error: String(error),
+  })
+  return undefined
+  }
   })
 
-  // Preserve-mode pressure is handled only at a tool-bearing turn boundary: by
+  // Preserve-mode pressure is handled at a tool-bearing turn boundary: by
   // turn_end every tool result from that turn is persisted, while the next
-  // provider request has not started yet. Calling ctx.compact() here
-  // would abort the active agent run, so write the generated preserve checkpoint
-  // through Pi's boundary API instead. Pi's native threshold remains the
-  // emergency/overflow fallback when a single turn overshoots before this point.
+  // provider request has not started yet. Trigger at the earlier of the preserve
+  // 90% budget and Pi's own threshold, then write context edits plus a hidden
+  // checkpoint through the boundary API. Calling ctx.compact() here would abort
+  // the active agent run and a real compaction entry would clear Pi's TUI history.
   pi.on("turn_end", async (event, ctx) => {
     const options = optionsFor(ctx)
     const model = ctx.model
@@ -485,8 +695,9 @@ aborted ? "warning" : "error",
     if (dynamicCompactions.has(sessionId)) return
 
     const log = loggerFor(options)
+    let triggerBranch: CompactionBranch = "normal (dynamic 90%)"
     try {
-      const branchEntries = ctx.sessionManager.getBranch() as SessionEntry[]
+    const branchEntries = ctx.sessionManager.getBranch() as SessionEntry[]
       const tokens = compactionMessageTokens(ctx, branchEntries)
       // If the latest preserve checkpoint already owns all compactable state,
       // another compaction cannot reclaim anything. In particular, visible-only
@@ -495,18 +706,25 @@ aborted ? "warning" : "error",
       if (tokens.newRawCompactable <= 0) return
       const preservedTokens = tokens.preserved
       const summarizer = resolveSummarizer(ctx, options, model)
+      const piSettings = piCompactionSettings(ctx, model)
       const summaryLimit = summaryOutputCap({
       configured: options.summaryMaxTokens,
+      reserveTokens: piSettings.reserveTokens,
       modelMaxTokens: summarizer.maxTokens,
       droppedTokens: tokens.compactable,
       })
       const headroomTokens = summaryLimit + PRESERVE_DYNAMIC_HEADROOM_MARGIN_TOKENS
       const budget = preserveCompactionBudget({
-        contextTokens: usage.tokens,
-        contextWindow: usage.contextWindow,
-        preservedTokens,
-        headroomTokens,
+      contextTokens: usage.tokens,
+      contextWindow: usage.contextWindow,
+      preservedTokens,
+      headroomTokens,
       })
+      const piThresholdTokens = Math.max(0, usage.contextWindow - piSettings.reserveTokens)
+      const beforePiThreshold = piSettings.enabled && usage.tokens >= piThresholdTokens
+      triggerBranch = budget.shouldCompact
+      ? "normal (dynamic 90%)"
+      : "normal (before Pi threshold)"
 
       log.record("dynamic_compaction_pressure", {
         sessionId,
@@ -520,12 +738,15 @@ aborted ? "warning" : "error",
         pressure: budget.pressure,
         headroomTokens,
         newRawCompactableTokens: tokens.newRawCompactable,
-        trigger: budget.shouldCompact,
-      })
-      if (!budget.shouldCompact) return
+        piReserveTokens: piSettings.reserveTokens,
+        piThresholdTokens,
+        beforePiThreshold,
+        trigger: budget.shouldCompact || beforePiThreshold,
+        })
+        if (!budget.shouldCompact && !beforePiThreshold) return
 
-      dynamicCompactions.add(sessionId)
-      log.both("dynamic preserve compaction triggered at turn boundary", {
+        dynamicCompactions.set(sessionId, triggerBranch)
+        log.both("dynamic preserve compaction triggered at turn boundary", {
         sessionId,
         contextTokens: usage.tokens,
         contextWindow: usage.contextWindow,
@@ -533,7 +754,7 @@ aborted ? "warning" : "error",
         pressure: budget.pressure,
       })
 
-      const previousPreserve = [...branchEntries].reverse().find(isPreserveDialogueCompaction)
+      // Historical checkpoints remain immutable request context; the new summary is delta-only.
       const syntheticEvent = {
         type: "session_before_compact",
         preparation: {
@@ -541,8 +762,9 @@ aborted ? "warning" : "error",
           tokensBefore: usage.tokens,
           messagesToSummarize: [],
           turnPrefixMessages: [],
-          ...(previousPreserve ? { previousSummary: previousPreserve.summary } : {}),
+          // Do not pass previousSummary: preserve mode never rewrites an old checkpoint.
           fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+          settings: piSettings,
         },
         branchEntries,
         customInstructions: undefined,
@@ -553,33 +775,28 @@ aborted ? "warning" : "error",
 
       const result = await handleCompaction(syntheticEvent, ctx)
       if (!result?.compaction) {
-        reportCompactionFailure(ctx, "normal (dynamic 90%)", true)
+        reportCompactionFailure(ctx, triggerBranch, true)
         log.record("dynamic_compaction_complete", { sessionId, cancelled: true })
         return
       }
 
       reportCompactionComplete(
-        ctx,
-        "normal (dynamic 90%)",
-        result.compaction.summary,
-        usage.tokens,
+      ctx,
+      triggerBranch,
+      result.compaction.summary,
+      usage.tokens,
       )
       log.record("dynamic_compaction_complete", { sessionId, cancelled: false })
 
-      return {
-        entries: [
-          ...event.entries,
-          {
-            type: "compaction" as const,
-            summary: result.compaction.summary,
-            firstKeptEntryId: null,
-            details: result.compaction.details,
-            usage: result.compaction.usage,
-          },
-        ],
-      }
+      const checkpointEntries = preserveDialogueBoundaryEntries({
+      branchEntries,
+      summary: result.compaction.summary,
+      tokensBefore: usage.tokens,
+      details: result.compaction.details as CacheCompactDetails,
+      })
+      return { entries: [...event.entries, ...checkpointEntries] }
     } catch (error) {
-      reportCompactionFailure(ctx, "normal (dynamic 90%)", false, String(error))
+      reportCompactionFailure(ctx, triggerBranch, false, String(error))
       log.record("dynamic_compaction_check_failed", {
         sessionId,
         error: String(error),
@@ -601,7 +818,7 @@ aborted ? "warning" : "error",
   ) return
   reportCompactionComplete(
       ctx,
-      compactionBranch(event.reason, dynamicCompactions.has(ctx.sessionManager.getSessionId())),
+      compactionBranch(event.reason, dynamicCompactions.get(ctx.sessionManager.getSessionId())),
       event.compactionEntry.summary,
       event.compactionEntry.tokensBefore,
     )
@@ -618,7 +835,7 @@ aborted ? "warning" : "error",
   ) return
   reportCompactionFailure(
       ctx,
-      compactionBranch(event.reason, dynamicCompactions.has(ctx.sessionManager.getSessionId())),
+      compactionBranch(event.reason, dynamicCompactions.get(ctx.sessionManager.getSessionId())),
       event.aborted,
       event.errorMessage,
     )
@@ -656,14 +873,47 @@ aborted ? "warning" : "error",
         activeModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         ...fingerprint,
       })
-      if (options.debugPayloads === true && fingerprint.summary !== true) {
-        // Keep the request that is about to hit the wire as `live_before`,
-        // and check whether this is the first request after a compaction.
-        if (dumpNextLive.delete(sessionId)) {
-          loggerFor(options).record("payload_dump", { sessionId, variant: "live_after", payload: snapshot(event.payload) })
-        }
-        recentLivePayloads.push({ sessionId, payload: snapshot(event.payload) })
-        if (recentLivePayloads.length > 2) recentLivePayloads.shift()
+      if (fingerprint.summary !== true) {
+      const payload = snapshot(event.payload)
+      const pending = pendingPostCompactionContext.get(sessionId)
+      if (pending) {
+      pendingPostCompactionContext.delete(sessionId)
+      const before = (pending.beforePayload ?? {}) as { messages?: unknown }
+      const after = payload as { messages?: unknown; tools?: unknown }
+      const beforeMessages = Array.isArray(before.messages) ? before.messages : []
+      const afterMessages = Array.isArray(after.messages) ? after.messages : []
+      const beforeRolling = rollingMessageHashes(beforeMessages)
+      const afterRolling = rollingMessageHashes(afterMessages)
+      const stableMessages = sharedPrefixLength(beforeRolling, afterRolling)
+      const branchEntries = ctx.sessionManager.getBranch() as SessionEntry[]
+      const branchCheckpoints = preserveDialogueStates(branchEntries).map((state, index) => ({
+      number: state.details?.checkpoint?.number ?? index + 1,
+      hash: shortHash(state.summary),
+      }))
+      loggerFor(options).record("post_compaction_context", {
+      sessionId,
+      checkpointNumber: pending.checkpointNumber,
+      branchCheckpoints,
+      cachePrefix: {
+      stableMessages,
+      beforeMessages: beforeMessages.length,
+      afterMessages: afterMessages.length,
+      firstDivergenceMessage:
+      stableMessages < Math.min(beforeMessages.length, afterMessages.length)
+      ? stableMessages
+      : null,
+      },
+      context: {
+      messages: snapshot(afterMessages),
+      tools: snapshot(Array.isArray(after.tools) ? after.tools : []),
+      },
+      })
+      }
+      if (options.debugPayloads === true && dumpNextLive.delete(sessionId)) {
+      loggerFor(options).record("payload_dump", { sessionId, variant: "live_after", payload })
+      }
+      recentLivePayloads.push({ sessionId, payload })
+      if (recentLivePayloads.length > 4) recentLivePayloads.shift()
       }
     } catch {
       /* logging must never break the request path */
@@ -726,8 +976,19 @@ aborted ? "warning" : "error",
     const model = ctx.model
     if (!model || !isModelAllowed(options.models, model.provider, model.id)) return
     compactionFailureReasons.delete(sessionId)
+    if (options.preserveDialogue === true && event.reason === "threshold") {
+    const tokens = compactionMessageTokens(ctx, event.branchEntries as SessionEntry[])
+    if (tokens.newRawCompactable <= 0) {
+    log.record("native_threshold_cancelled_no_new_compactable_state", {
+    sessionId,
+    tokensBefore: event.preparation.tokensBefore,
+    historicalCheckpointTokens: tokens.historicalCheckpoints,
+    })
+    return { cancel: true }
+    }
+    }
     if (options.preserveDialogue === true) {
-const branch = compactionBranch(event.reason, dynamicCompactions.has(sessionId))
+const branch = compactionBranch(event.reason, dynamicCompactions.get(sessionId))
 try {
 const tokens = compactionMessageTokens(ctx, event.branchEntries as SessionEntry[])
 const usage = ctx.getContextUsage()
@@ -736,6 +997,7 @@ usage?.tokens === null || usage === undefined ? undefined : usage.tokens
 pendingCompactionUi.set(sessionId, {
 branch,
 tokens,
+scope: preserveDeltaScope(event.branchEntries as SessionEntry[]),
 ...(contextTokens === undefined ? {} : { contextTokens }),
 ...(usage === undefined ? {} : { contextWindow: usage.contextWindow }),
 })
@@ -745,7 +1007,7 @@ contextTokens === undefined || usage === undefined
 : ` | context ${contextTokens}/${usage.contextWindow} tok`
 notify(
 ctx,
-`[cache-compact] ${branch}\npreserved messages: ${tokens.preserved} tok | compactable messages: ${tokens.compactable} tok${context}`,
+`[cache-compact] ${branch}\npreserved dialogue: ${tokens.preservedDialogue} tok | historical checkpoints: ${tokens.historicalCheckpoints} tok (${tokens.checkpointCount}) | new raw compactable: ${tokens.newRawCompactable} tok${context}`,
 event.reason === "overflow" ? "warning" : "info",
 )
 } catch {
@@ -813,8 +1075,12 @@ event.preparation.firstKeptEntryId,
 ...event.preparation.messagesToSummarize,
 ...event.preparation.turnPrefixMessages,
 ]) as AgentMessage[]
+const preserveDeltaAgent = preserveDialogueDeltaMessages(event.branchEntries as SessionEntry[])
+const preserveScope = options.preserveDialogue === true
+? preserveDeltaScope(event.branchEntries as SessionEntry[])
+: undefined
 const summaryScopeAgent =
-options.preserveDialogue === true ? effectiveAgent : nativeDroppedAgent
+options.preserveDialogue === true ? preserveDeltaAgent : nativeDroppedAgent
 const liveMessages = convertToLlm(effectiveAgent)
 const observedCount = liveRequestCounts.get(sessionId)
 const requestMessages =
@@ -836,17 +1102,18 @@ turnPrefixCount:
 options.preserveDialogue === true
 ? 0
 : event.preparation.turnPrefixMessages?.length ?? 0,
-...(event.preparation.previousSummary
+...(options.preserveDialogue !== true && event.preparation.previousSummary
 ? { previousSummary: event.preparation.previousSummary }
 : undefined),
 options,
 customInstructions: event.customInstructions,
+preserveUserMessageOrdinals: preserveScope?.coveredUserMessages,
 contextWindow: (summarizer as { contextWindow?: number }).contextWindow,
 reserveTokens: event.preparation.settings?.reserveTokens,
 modelMaxTokens: (summarizer as { maxTokens?: number }).maxTokens,
 summaryMaxTokens: options.summaryMaxTokens,
 ...(options.preserveDialogue === true
-? { reclaimedTokens: compactionMessageTokens(ctx, event.branchEntries as SessionEntry[]).compactable }
+? { reclaimedTokens: compactionMessageTokens(ctx, event.branchEntries as SessionEntry[]).newRawCompactable }
 : undefined),
 })
 // Preserve mode must absorb every tool interaction that exists at this
@@ -1069,44 +1336,174 @@ summaryMaxTokens: options.summaryMaxTokens,
       blocks: describeContent(response.content, options.debugPayloads === true),
     })
     }
-    // Pi appends a machine-computed file list to every summary; the model's
-      // text is only the prose part. Mirroring it keeps summaries identical in
-      // shape whichever path produced them.
-const previousPreserve = [...(event.branchEntries as SessionEntry[])]
-.reverse()
-.find(isPreserveDialogueCompaction)
-const { readFiles, modifiedFiles } =
-options.preserveDialogue === true
-? computeFileListsFromMessages(effectiveAgent, previousPreserve?.details)
-: computeFileLists(event.preparation.fileOps)
-const summary = extractSummaryText(response.content) + formatFileOperations(readFiles, modifiedFiles)
+    // Pi appends a machine-computed file list to every summary. In preserve
+    // mode this is checkpoint-local state: historical checkpoint appendices are
+    // immutable and must not be merged into the new delta checkpoint.
+    const { readFiles, modifiedFiles } =
+    options.preserveDialogue === true
+    ? computeFileListsFromMessages(preserveDeltaAgent)
+    : computeFileLists(event.preparation.fileOps)
+    const summary = extractSummaryText(response.content) + formatFileOperations(readFiles, modifiedFiles)
     const details: CacheCompactDetails = {
-      readFiles,
-      modifiedFiles,
-      ...(options.preserveDialogue === true
-        ? { cacheCompact: PRESERVE_DIALOGUE_MARKER }
-        : undefined),
+    readFiles,
+    modifiedFiles,
+    ...(options.preserveDialogue === true
+    ? { cacheCompact: PRESERVE_DIALOGUE_MARKER }
+    : undefined),
     }
-      recordCacheOutcome(response.usage)
-      log.both("wrote cache-friendly summary", {
-        sessionId,
-        chars: summary.length,
-        cacheRead: response.usage.cacheRead,
-        cacheWrite: response.usage.cacheWrite,
-        input: response.usage.input,
-        durationMs: Date.now() - startedAt,
-        summarizer: `${summarizer.provider}/${summarizer.id}`,
-      })
-      log.record("summary_result", {
-        sessionId,
-        askHash,
-        durationMs,
-        stopReason: response.stopReason,
-        chars: summary.length,
-        usage: response.usage,
-        cacheRead: response.usage.cacheRead,
-        cacheWrite: response.usage.cacheWrite,
-      })
+    recordCacheOutcome(response.usage)
+
+    if (options.preserveDialogue === true) {
+    const branchEntries = event.branchEntries as SessionEntry[]
+    const scope = preserveDeltaScope(branchEntries)
+    const tokens = compactionMessageTokens(ctx, branchEntries)
+    const preview = previewPreservedContextAfterCheckpoint({
+    branchEntries,
+    summary,
+    tokensBefore: event.preparation.tokensBefore,
+    details,
+    })
+    let systemCount = 0
+    while (effectiveAgent[systemCount]?.role === "system") systemCount += 1
+    const afterAgent = [...effectiveAgent.slice(0, systemCount), ...preview]
+    const afterMessages = convertToLlm(afterAgent)
+    const afterNonSystem = afterMessages.filter((message) => message.role !== "system")
+    const estimatedAfterNonSystem = Math.ceil(estimateMessagesTokens(afterNonSystem) * tokens.scale)
+    const newCheckpointMessages = preview.slice(-1)
+    const newCheckpointTokens = Math.ceil(
+    estimateMessagesTokens(convertToLlm(newCheckpointMessages)) * tokens.scale,
+    )
+    const reclaimed = Math.max(0, tokens.newRawCompactable - newCheckpointTokens)
+    const checkpointHashes = preserveDialogueStates(branchEntries).map((state, index) => ({
+    number: state.details?.checkpoint?.number ?? index + 1,
+    entryId: "id" in state.entry ? state.entry.id : undefined,
+    hash: shortHash(state.summary),
+    }))
+    const beforeStructural = convertToLlm(effectiveAgent)
+    const beforeRolling = rollingMessageHashes(beforeStructural)
+    const afterRolling = rollingMessageHashes(afterMessages)
+    const stablePrefixMessages = sharedPrefixLength(beforeRolling, afterRolling)
+    const stablePrefixTokens = Math.ceil(
+    estimateMessagesTokens(afterMessages.slice(0, stablePrefixMessages)) * tokens.scale,
+    )
+    const firstDivergenceMessage =
+    stablePrefixMessages < Math.min(beforeRolling.length, afterRolling.length)
+    ? stablePrefixMessages
+    : null
+    const divergenceBefore = firstDivergenceMessage === null ? undefined : beforeStructural[firstDivergenceMessage]
+    const divergenceAfter = firstDivergenceMessage === null ? undefined : afterMessages[firstDivergenceMessage]
+    const lastLive = [...recentLivePayloads].reverse().find((entry) => entry.sessionId === sessionId)
+    const lastLiveRecord = (lastLive?.payload ?? {}) as { tools?: unknown }
+    const toolDeclarations = Array.isArray(lastLiveRecord.tools) ? lastLiveRecord.tools : []
+    const systemPromptTokens = Math.ceil(
+      estimateMessagesTokens(beforeStructural.filter((message) => message.role === "system")) * tokens.scale,
+    )
+    const toolDeclarationTokens = Math.ceil(
+      estimateMessagesTokens(toolDeclarations) * tokens.scale,
+    )
+    const providerOverhead = Math.max(0, event.preparation.tokensBefore - tokens.nonSystemTotal)
+    const otherProviderOverhead = Math.max(
+      0,
+      providerOverhead - systemPromptTokens - toolDeclarationTokens,
+    )
+    const estimatedAfter = estimatedAfterNonSystem + providerOverhead
+
+    log.record("preserve_compaction", {
+    sessionId,
+    trigger: pendingCompactionUi.get(sessionId)?.branch,
+    checkpoint: {
+    number: scope.nextCheckpointNumber,
+    coveredUserMessages: scope.coveredUserMessages,
+    summary,
+    summaryHash: shortHash(summary),
+    tokens: newCheckpointTokens,
+    },
+    historicalCheckpoints: checkpointHashes,
+    toolDeclarations: snapshot(toolDeclarations),
+    scope: {
+    afterCheckpoint: scope.checkpointCount || null,
+    coveredUserMessages: scope.coveredUserMessages,
+    rawMessageCount: preserveDeltaAgent.length,
+    rawEntryCount: scope.rawEntryCount,
+    rawEntryIds: scope.rawEntryIds,
+    firstRawEntryId: scope.firstRawEntryId ?? null,
+    lastRawEntryId: scope.lastRawEntryId ?? null,
+    },
+    tokens: {
+    providerContextBefore: event.preparation.tokensBefore,
+    estimatedNonSystemBefore: tokens.nonSystemTotal,
+    providerPromptOverhead: providerOverhead,
+    estimatedSystemPrompt: systemPromptTokens,
+    estimatedToolDeclarations: toolDeclarationTokens,
+    estimatedOtherProviderOverhead: otherProviderOverhead,
+    preservedDialogue: tokens.preservedDialogue,
+    preservedUserMessages: tokens.preservedUserMessages,
+    preservedAssistantText: tokens.preservedAssistantText,
+    historicalCheckpoints: tokens.historicalCheckpoints,
+    historicalCheckpointCount: tokens.checkpointCount,
+    newRawCompactable: tokens.newRawCompactable,
+    rawToolCalls: tokens.rawToolCalls,
+    rawToolResults: tokens.rawToolResults,
+    rawReasoning: tokens.rawReasoning,
+    rawOther: tokens.rawOther,
+    newCheckpoint: newCheckpointTokens,
+    remainingRawCompactable: 0,
+    estimatedContextAfter: estimatedAfter,
+    estimatedReclaimed: reclaimed,
+    compression: newCheckpointTokens > 0 ? tokens.newRawCompactable / newCheckpointTokens : null,
+    },
+    cachePrefixPreview: {
+    stableMessages: stablePrefixMessages,
+    stableEstimatedTokens: stablePrefixTokens,
+    firstDivergenceMessage,
+    firstDivergence: firstDivergenceMessage === null
+    ? null
+    : {
+    index: firstDivergenceMessage,
+    reason: "preserve compaction removed or changed raw technical state at this message",
+    beforeRole: (divergenceBefore as { role?: unknown } | undefined)?.role,
+    beforeKind: debugMessageKind(divergenceBefore),
+    beforeHash: shortHash(divergenceBefore),
+    afterRole: (divergenceAfter as { role?: unknown } | undefined)?.role,
+    afterKind: debugMessageKind(divergenceAfter),
+    afterHash: shortHash(divergenceAfter),
+    },
+    },
+    contextBefore: snapshot(beforeStructural),
+    contextAfter: snapshot(afterMessages),
+    contextIndex: {
+    before: debugContextIndex(beforeStructural, tokens.scale, branchEntries),
+    after: debugContextIndex(afterMessages, tokens.scale, branchEntries, { number: scope.nextCheckpointNumber, summary }),
+    },
+    })
+
+    if (options.debug === true && options.debugFile) {
+    pendingPostCompactionContext.set(sessionId, {
+    checkpointNumber: scope.nextCheckpointNumber,
+    beforePayload: lastLive?.payload,
+    })
+    }
+    }
+
+    log.both("wrote cache-friendly summary", {
+    sessionId,
+    chars: summary.length,
+    cacheRead: response.usage.cacheRead,
+    cacheWrite: response.usage.cacheWrite,
+    input: response.usage.input,
+    durationMs: Date.now() - startedAt,
+    summarizer: `${summarizer.provider}/${summarizer.id}`,
+    })
+    log.record("summary_result", {
+    sessionId,
+    askHash,
+    durationMs,
+    stopReason: response.stopReason,
+    chars: summary.length,
+    usage: response.usage,
+    cacheRead: response.usage.cacheRead,
+    cacheWrite: response.usage.cacheWrite,
+    })
       return {
         compaction: {
           summary,

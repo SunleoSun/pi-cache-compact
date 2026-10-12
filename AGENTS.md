@@ -1,113 +1,90 @@
 # AGENTS.md
 
-Guidance for agents working in this repo. Read [`README.md`](README.md) first for
-what the extension is and how it is installed.
+Guidance for agents working in this repo. Read [`README.md`](README.md) and `sun-memory/project/index.md` first, then the relevant SunMemory architecture/workflow collection before changing owning behavior. Update stale SunMemory in the same transaction as any durable invariant change.
 
 ## Hard rules
 
-**Never run `git commit` or `git push`** unless explicitly asked in that message.
-Write files, stage nothing, report what changed, and let the human commit.
+**Never run `git commit` or `git push`** unless explicitly asked in that message. Preserve unrelated working-tree changes.
 
-**Conventional Commits**, title line only, imperative, lower case, no trailing
-period: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `build:`,
-`ci:`, `perf:`.
+**Conventional Commits**, title line only, imperative, lower case, no trailing period: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `build:`, `ci:`, `perf:`.
 
-**Semantic Versioning.** Bump `version` in `package.json` in the same commit:
-`feat` → minor, `fix` → patch, breaking → major. `docs`/`test`/`chore` do not
-need a bump unless they change published behaviour.
+**Semantic Versioning.** Published behavioral fixes bump patch, features minor, breaking changes major. Keep `package.json` and the root package version in `package-lock.json` aligned.
 
-**No secrets, ever** — nothing here needs one.
+**No secrets, ever.**
 
 ## What this is
 
-A Pi extension that replaces Pi's compaction *summary generation* with a
-cache-friendly one:
+A Pi extension that makes compaction cache-friendly while preserving the human conversation. Preserve mode triggers at the earlier of its dynamic 90% pressure limit or Pi's effective native threshold, at a tool-bearing `turn_end`, summarizes only new tool-derived state as a forward continuation, removes that raw tool/reasoning state from model context through context edits, and appends a hidden tool checkpoint without clearing Pi's raw/TUI transcript.
 
-> preserve mode reaches 90% of the budget left after permanent dialogue ->
-> `turn_end` (all tool results persisted, next provider request not started) ->
-> we send the summarization ask as a continuation of the live conversation ->
-> append a preserve compaction boundary and let the agent continue. Pi's native
-> threshold/overflow path remains the emergency fallback through `session_before_compact`.
+## Canonical owners
 
-It exists for two reasons, both in README → "Why": Pi's default summary is a
-cold, brand-new prompt (no cache reuse possible), and it truncates every tool
-result to 2,000 characters before summarizing, which for a coding session is
-most of the substance.
+- `src/preserve.ts` — permanent-context semantics, append-only checkpoint lifecycle, delta boundary, restoration.
+- `src/build.ts` — summary prompt, request planning, fit/token-budget helpers.
+- `src/extension.ts` — Pi hooks, trigger policy, provider calls, UI and observability.
+- `src/debug.ts` — cache fingerprints and bounded structured debug log.
+- `src/config.ts` — configuration parsing/merging.
 
 ## Invariants — do not break these
 
 | Thing | Why |
 |---|---|
-| `src/extension.ts` default-exports the factory and nothing else at runtime | Pi calls the default export; extra runtime exports are noise. Type-only exports are fine. |
-| Preserve mode triggers dynamically at 90% of the budget left after permanent dialogue, only at tool-bearing `turn_end` boundaries | Count every user message and visible assistant text block with the same semantic owner used by restoration, subtract that plus summary headroom from the context window, and compact when the rest reaches 90%. The boundary is after the turn's tool results are persisted and before the next provider request; do not use `ctx.compact()` there because it aborts the active run. Pi's fixed reserveTokens threshold is only the emergency fallback for a single turn that overshoots before the boundary. |
-| Preserve-mode UI diagnostics are observational only | In interactive Pi, report the trigger branch, preserved/compactable message-token estimates, full context usage, and the resulting tools/results checkpoint. Notification failure must never affect compaction. |
-| The summary request must reuse the conversation's exact prefix | Same system prompt, same tools, same messages, then the ask. Anything else and the cache misses — the whole point is lost. |
-| The ask is a **forward continuation**, never a rewind to the dropped span by default | An append-only server cache reuses only if the new prompt extends what it holds. Preserve mode requires the whole live continuation because every current tool result must be represented; the shorter last-request continuation is valid only outside preserve mode because it can omit fresh tool results. |
-| The summary ceiling is derived, not a constant: Pi's `0.8 × reserveTokens` clamped to the model, bounded by half of what the compaction drops, floored at 2048 | A ceiling is not a target, so a generous one costs nothing and avoids the expensive failure (a cap-truncated reply is rejected and Pi's default runs). Pi's reserve alone is not the invariant it looks like — split turns apply it twice and can exceed it — so it is bounded by what the compaction actually reclaims. `summaryMaxTokens` overrides. |
-| A rewind is a deliberate opt-in (`rewindWhenNeeded`, `continuation: false`), never a silent fallback | A rewind never reused a cache in any measurement and costs a cold prefill. Where only the rewind fits, normal mode may leave compaction to Pi; preserve mode cancels because Pi's lossy fallback would violate verbatim dialogue. |
-| Fit estimates are calibrated against the server's reported prompt size | `bytes / 3` alone is ~3x high on blob-heavy transcripts: it refuses shapes that fit and makes the reclaimed-size ceiling inert. `tokenScale` derives one ratio per decision from a reported prompt and the same messages. |
-| A large summary cache miss defers another full-prefix attempt for 15 minutes | `usage.cacheRead === 0` with a large prompt means the checkpoint is gone. Normal mode may use Pi's small fallback; preserve mode must cancel instead of losing verbatim dialogue. `deferAfterCacheMiss: false` opts out. |
-| With `preserveDialogue: false`, the ask is Pi's compaction prompt; the default preserve mode uses a tool-only checkpoint | Pi's default prompts remain vendored in `build.ts`. Preserve-dialogue mode must never paraphrase user messages or visible assistant prose: raw dialogue is restored through the `context` hook, while the summary owns only compacted tool-derived state; old reasoning is discarded. Both modes keep the machine-computed `<read-files>`/`<modified-files>` appendix and versioned `details`. |
-| Preserve mode compacts **all** tool traffic present at compaction time | Pi's native `firstKeptEntryId` / `keepRecentTokens` cut is not the semantic owner in preserve mode. The tool checkpoint covers all current tool calls/results; the context hook restores all pre-compaction user messages + visible assistant text, drops all pre-compaction tools/reasoning (including Pi's nominal kept tail), then keeps only messages created after the compaction raw. Normal `preserveDialogue: false` mode still follows Pi's native cut. |
-| Do not pass `systemPrompt`/`tools` when the projection already has a leading system message | The provider would replay/concatenate the prompt twice and the prefix would break. See `hasLeadingSystemMessage` in `extension.ts`. |
-| Never accept a truncated, aborted, tool-calling, or empty summary **after one retry** | A bad summary must never become the new conversation prefix. Normal mode returns `undefined` so Pi's default runs; `preserveDialogue` returns `{ cancel: true }` so verbatim dialogue cannot be lost. The one retry is for a reply that stopped with no text block; other failures repeat deterministically. |
-| Never throw out of the handler | In normal mode Pi's fallback remains valid. In `preserveDialogue` mode a fallback would violate the verbatim-dialogue invariant, so cancel that compaction instead of silently delegating to Pi's lossy summary. |
-| Debug `onPayload` hook returns `undefined` and never throws | A returned value would replace the outgoing request payload; a throw would kill the summarization call. Fingerprint only. |
-| `src/build.ts` stays pure (type-only SDK imports) | Unit tests exercise it without booting Pi. Message conversion (`convertToLlm`) happens in `extension.ts`; `planSummaryRequest` takes already-converted messages. |
-| The request shape and the ask are decided once, by `planSummaryRequest` | The handler hashes the ask to tag in-flight requests, and the fallback tag must match the ask that is actually sent. Two places computing the ask drifted apart once already. |
+| Preserve mode permanently keeps every user message, visible assistant text block, and every active historical Tool Context Checkpoint | These are the immutable cached conversation prefix. Old reasoning/tool traffic is not permanent. |
+| Tool checkpoints are **append-only deltas** | A new checkpoint summarizes only raw tool/reasoning state after the latest active checkpoint. Never merge, rewrite, null, or supersede an older checkpoint. Legacy aggregated checkpoints become the immutable baseline. |
+| Checkpoint summaries are result-oriented and grouped by absolute `User message N` | Preserve tool-derived findings/data, actual changes, validation evidence and unresolved state; do not replace results with a list of tool invocations and do not paraphrase the preserved user prompt. |
+| Proactive preserve checkpointing must not append a Pi `compaction` entry | Pi clears/rebuilds TUI history on real compaction entries. Use context edits plus a `display:false` custom checkpoint so raw transcript history stays visible. |
+| Preserve mode triggers only at tool-bearing `turn_end`, at the earlier of the 90% permanent-context budget or Pi's effective threshold | At that boundary all tool results are persisted and the next provider request has not started. Do not call `ctx.compact()` there because it aborts the active run. |
+| The summary request is a forward continuation of the live conversation | Same stable system/tool/message prefix, then the summary ask, maximizes cache reuse. Preserve mode must not silently rewind by default. |
+| Historical checkpoints remain in the summary request only as immutable prefix context | They are never passed as `previousSummary` material to update. The summary scope is the new raw delta only. |
+| Preserve-mode file appendices are checkpoint-local | Do not merge prior checkpoint file lists into a new delta checkpoint. Historical appendices remain in their immutable checkpoint. |
+| Preserve token accounting is dialogue + historical checkpoints + new raw delta | Historical checkpoints are preserved tokens, not compactable state. UI/debug must label provider-reported vs estimated counts honestly. |
+| Preserve mode compacts all new tool traffic in the delta | Tool calls/results/reasoning created after the latest checkpoint must be absorbed before success. If the valid full-delta request cannot be made, fail closed. |
+| A rewind is opt-in (`rewindWhenNeeded`, `continuation: false`) | Rewinds lose append-only cache reuse. Preserve mode cancels rather than silently taking a lossy fallback. |
+| Bad summaries are never persisted | Reject truncated, aborted, tool-calling, or empty-after-retry replies. Preserve mode cancels rather than delegating to Pi's lossy summary. |
+| Provider/debug hooks never throw or mutate provider payloads accidentally | Observability must not affect compaction. |
+| `debugFile` is rolling JSONL capped at 1 MiB | `preserve_compaction` is a self-contained audit with predicted context before/after, per-message hashes/kinds/token estimates, raw delta entry IDs, checkpoint hashes, complete token accounting and divergence diagnostics; `post_compaction_context` records the actual next provider context/prefix. Oldest complete records are evicted. |
+| `src/build.ts` stays pure | Unit tests load it without booting Pi. Provider/message conversion remains in `extension.ts`. |
 
 ## Layout
 
-```
-src/extension.ts   # default export; session_before_compact handler
-src/build.ts       # pure helpers: prompt, tool declarations, request assembly
-src/config.ts      # option parsing + merging JSON files
-src/debug.ts       # rolling hashes + payload fingerprints + JSONL debug logger
-scripts/compare-dumps.mjs  # diff payload_dump records from debugFile
-test/              # build, config, debug, extension (mock ctx), e2e (real Pi + mock model)
+```text
+src/extension.ts
+src/build.ts
+src/preserve.ts
+src/config.ts
+src/debug.ts
+scripts/compare-dumps.mjs
+sun-memory/
+project/index.md
+architecture/
+workflows/
+test/
 ```
 
 ## Commands
 
 ```bash
 npm install
-npm run typecheck # tsc --noEmit
-npm test # unit tests (node --test)
-npm run test:e2e # real `pi --print` + mock model server (opt-in)
-npm run certify # typecheck + unit suite + real-Pi e2e certification
+npm run typecheck
+npm test
+npm run test:e2e
+npm run certify
 ```
 
-Node 24+ — the repo runs TypeScript directly and uses `node --test`.
+Node 24+; TypeScript runs directly.
 
-## Verifying
+## Verification
 
-- **Unit** (`npm test`) covers the pure assembly, option parsing, and the
-  handler's fallbacks with a mock context. Any change to the request shape, the
-  fallback rules, or the options needs a matching test.
-- **End-to-end** (`npm run test:e2e`) is the one that catches real Pi behaviour:
-it spawns `pi --print` with the extension loaded from source and a mock
-OpenAI-compatible server that records HTTP bodies. Besides the cache-prefix
-contract, the preserve-dialogue certification runs multiple real Pi processes
-against one resumed session and proves repeated compaction restores old user
-prompts and visible assistant prose verbatim while compacted tool traffic stays
-out. Run it after touching the entry point, hooks, restore logic, or request
-assembly.
-- **Certification** (`npm run certify`) is the release-grade local proof:
-typecheck + the complete unit suite + the real-Pi e2e suite. It needs no
-network and no credentials.
+- `npm test` is the single complete test entrypoint: unit/integration tests, package metadata certification, and real-Pi E2E all run automatically.
+- Real-Pi E2E covers forward cache continuation, three append-only checkpoints across restarts, actual post-compaction provider context, and raw/TUI transcript preservation.
+- `npm run certify` is the release-grade local proof: typecheck + the complete `npm test` suite. `npm run test:e2e` is only a focused debugging alias.
+- Run `git diff --check HEAD` and inspect Git/transaction diffs before finishing.
 
-## Releasing
+## Release
 
-`npm publish` runs `prepublishOnly` (typecheck + unit tests). Bump `version` in
-`package.json` in the release commit, with a matching `feat:`/`fix:` message.
-The published package loads `src/extension.ts` directly (`pi.extensions`), so
-there is no build step to forget — but that also means the shipped code is the
-TypeScript source, and `files` must keep `src/` and `scripts/`.
+`npm publish` runs `prepublishOnly`. Publish only when explicitly requested. Stable Pi update command:
 
-## Conventions
+```bash
+pi update npm:pi-cache-compact-preserved-messages
+```
 
-- Prefer explaining *why* in comments — especially the prefix-reuse invariant.
-- Keep the README caveats honest: if a workaround is removed, explain the cost
-  in the same change.
-- Config lives in `cache-compact.json` under the agent dir and `<cwd>/.pi`;
-  document any new option in the README table.
+MCP transaction commit is not a Git commit.

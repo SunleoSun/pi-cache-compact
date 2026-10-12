@@ -12,7 +12,7 @@
  *      request — i.e. a prefix-caching server would serve it from cache;
  *   3. the summary it returns is the one Pi then persists.
  *
- * Opt-in: `npm run test:e2e`. Needs no network and no credentials.
+ * Runs automatically under `npm test`; `npm run test:e2e` is a focused alias. Needs no network or credentials.
  */
 
 import { test } from "node:test"
@@ -24,9 +24,9 @@ import fs from "node:fs"
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
-import { sharedPrefixLength } from "../src/debug.ts"
+import { rollingMessageHashes, sharedPrefixLength } from "../src/debug.ts"
 
-const enabled = process.env.PI_CACHE_COMPACT_E2E === "1" || process.env.npm_lifecycle_event === "test:e2e"
+const enabled = process.env.PI_CACHE_COMPACT_E2E === "1" || process.env.npm_lifecycle_event === "test:e2e" || process.env.npm_lifecycle_event === "test"
 const here = path.dirname(fileURLToPath(import.meta.url))
 const extensionPath = path.resolve(here, "../src/extension.ts")
 
@@ -91,7 +91,7 @@ function startMockModel() {
         (/technical checkpoint ONLY from tool activity/i.test(lastText) || /technical tool-context checkpoint/i.test(lastText)))
 const wantsTool =
 !isSummary && last?.role === "user" && lastText.includes(MARKER) && Array.isArray(body.tools)
-const toolCallId = `call_${toolCalls + 1}`
+const toolCallId = `call_${toolCalls + 1}`; const summaryText = `${SUMMARY_TEXT} #${toolCalls}`
 
       const sse = (payload: unknown) => `data: ${JSON.stringify(payload)}\n\n`
       const chunk = (choices: any[], extra: any = {}) => ({
@@ -106,7 +106,7 @@ const toolCallId = `call_${toolCalls + 1}`
       if (body.stream === false) {
         res.writeHead(200, { "content-type": "application/json" })
         const message = isSummary
-          ? { role: "assistant", content: SUMMARY_TEXT }
+          ? { role: "assistant", content: summaryText }
           : wantsTool
             ? {
                 role: "assistant",
@@ -176,7 +176,7 @@ const toolCallId = `call_${toolCalls + 1}`
         return
       }
 
-      const text = isSummary ? SUMMARY_TEXT : "done"
+      const text = isSummary ? summaryText : "done"
       res.write(sse(chunk([{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }])))
       res.write(sse(chunk([{ index: 0, delta: {}, finish_reason: "stop" }], { usage })))
       res.write("data: [DONE]\n\n")
@@ -525,12 +525,14 @@ const mock = await startMockModel()
 const debugFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-preserve-")), "debug.jsonl")
 const firstPrompt = `${MARKER} FIRST USER REQUIREMENT: preserve this exact text`
 const secondPrompt = `${MARKER} SECOND USER REQUIREMENT: preserve this exact text`
+const thirdPrompt = `${MARKER} THIRD USER REQUIREMENT: preserve this exact text`
 const finalPrompt = "CERTIFICATION FINAL PROBE"
 let run: Awaited<ReturnType<typeof runPi>> | undefined
 try {
 run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: true, prompt: firstPrompt, probeContent: "FIRST TOOL OUTPUT\\n" })
 const root = run.root
 run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: true, root, prompt: secondPrompt, probeContent: "SECOND TOOL OUTPUT\\n" })
+run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: true, root, prompt: thirdPrompt, probeContent: "THIRD TOOL OUTPUT\\n" })
 run = await runPi(mock, { debugFile, thinking: "low", preserveDialogue: true, root, prompt: finalPrompt })
 
 const context = `pi exited with ${run.code}\n--- stderr ---\n${run.stderr}\n--- requests ---\n${dump(mock.requests)}`
@@ -553,12 +555,12 @@ isToolSummaryRequest(request) && !isToolSummaryRequest(mock.requests[index - 1])
 .filter((index) => index >= 0)
 assert.equal(
 summaryIndexes.length,
-2,
-`expected exactly the two tool-bearing preserve-dialogue compactions, got ${summaryIndexes.length}\n${context}`,
+3,
+`expected exactly the three tool-bearing preserve-dialogue compactions, got ${summaryIndexes.length}\n${context}`,
 )
 
-const expectedToolOutputs = ["FIRST TOOL OUTPUT", "SECOND TOOL OUTPUT"]
-for (const [ordinal, summaryIndex] of summaryIndexes.slice(0, 2).entries()) {
+const expectedToolOutputs = ["FIRST TOOL OUTPUT", "SECOND TOOL OUTPUT", "THIRD TOOL OUTPUT"]
+for (const [ordinal, summaryIndex] of summaryIndexes.slice(0, 3).entries()) {
 const summaryReq = mock.requests[summaryIndex]
 const previous = mock.requests[summaryIndex - 1]
 assert.ok(previous, `no live request before summary #${summaryIndex}\n${context}`)
@@ -587,6 +589,24 @@ ask,
 /stay in the context verbatim/,
 `preserve summary #${summaryIndex} incorrectly retained a pre-compaction tail\n${context}`,
 )
+assert.match(ask, /NEW compact incremental technical checkpoint/i)
+assert.match(ask, /Historical Tool Context Checkpoints are immutable preserved context/)
+assert.match(ask, /User message N/)
+assert.match(ask, /Summarize RESULTS/i)
+assert.match(ask, new RegExp(`absolute user-message ordinal\\(s\\): ${ordinal + 1}(?:\\D|$)`))
+const serialized = JSON.stringify(summaryReq.body.messages)
+assert.equal(
+serialized.split(SUMMARY_TEXT).length - 1,
+ordinal,
+`summary #${summaryIndex} did not retain exactly ${ordinal} immutable prior checkpoint(s)\n${context}`,
+)
+for (let prior = 0; prior < ordinal; prior++) {
+assert.ok(
+!serialized.includes(expectedToolOutputs[prior]),
+`summary #${summaryIndex} reintroduced raw tool state from checkpoint #${prior + 1}\n${context}`,
+)
+}
+assert.doesNotMatch(ask, /Update the existing|PRESERVE all existing information/i)
 }
 
 const finalLive = [...mock.requests]
@@ -617,21 +637,28 @@ userTexts.filter((text: string) => text === secondPrompt).length,
 `second user prompt was not preserved exactly once\n${context}`,
 )
 assert.equal(
+userTexts.filter((text: string) => text === thirdPrompt).length,
+1,
+`third user prompt was not preserved exactly once\n${context}`,
+)
+assert.equal(
 assistantTexts.filter((text: string) => text === "done").length,
-2,
-`visible assistant replies were not preserved verbatim across both compactions\n${context}`,
+3,
+`visible assistant replies were not preserved verbatim across all three compactions\n${context}`,
 )
 
 const rendered = JSON.stringify(messages)
 assert.equal(
 rendered.split(SUMMARY_TEXT).length - 1,
-1,
-`technical summary must appear exactly once in the final model context\n${context}`,
+3,
+`all three immutable technical checkpoints must remain in the final model context\n${context}`,
 )
 assert.ok(!rendered.includes("FIRST TOOL OUTPUT"), `first compacted tool output leaked back into model context\n${context}`)
 assert.ok(!rendered.includes("SECOND TOOL OUTPUT"), `second compacted tool output leaked back into model context\n${context}`)
+assert.ok(!rendered.includes("THIRD TOOL OUTPUT"), `third compacted tool output leaked back into model context\n${context}`)
 assert.ok(!rendered.includes("call_1"), `first compacted tool call leaked back into model context\n${context}`)
 assert.ok(!rendered.includes("call_2"), `second compacted tool call leaked back into model context\n${context}`)
+assert.ok(!rendered.includes("call_3"), `third compacted tool call leaked back into model context\n${context}`)
 
 const sessionText = fs
 .readdirSync(run.agentDir, { recursive: true })
@@ -639,11 +666,109 @@ const sessionText = fs
 .map((file) => fs.readFileSync(path.join(run!.agentDir, String(file)), "utf8"))
 .join("\n")
 assert.ok(sessionText.includes(firstPrompt), "raw session lost the first user prompt")
-assert.ok(sessionText.includes(secondPrompt), "raw session lost the second user prompt")
-assert.ok(
-(sessionText.match(/"mode":"preserve-dialogue-v1"/g) ?? []).length >= 2,
-"repeated compactions did not persist preserve-dialogue markers",
+assert.ok(sessionText.includes(secondPrompt), "raw session lost the second user prompt"); assert.ok(sessionText.includes(thirdPrompt), "raw session lost the third user prompt")
+assert.ok(sessionText.includes("FIRST TOOL OUTPUT"), "raw session/TUI history lost the first tool result")
+assert.ok(sessionText.includes("SECOND TOOL OUTPUT"), "raw session/TUI history lost the second tool result"); assert.ok(sessionText.includes("THIRD TOOL OUTPUT"), "raw session/TUI history lost the third tool result")
+assert.ok(sessionText.includes("cache-compact-preserve-checkpoint"), "hidden preserve checkpoint was not persisted")
+assert.doesNotMatch(
+sessionText,
+/\"type\":\"compaction\"/,
+"proactive preserve checkpoints must not create Pi compaction entries that clear the TUI transcript",
 )
+assert.ok(
+(sessionText.match(/\"mode\":\"preserve-dialogue-v1\"/g) ?? []).length >= 3,
+"repeated checkpoints did not persist preserve-dialogue markers",
+)
+
+const debugRecords = fs
+.readFileSync(debugFile, "utf8")
+.split("\n")
+.filter(Boolean)
+.map((line) => JSON.parse(line) as any)
+const compactionRecords = debugRecords.filter((record) => record.kind === "preserve_compaction")
+assert.equal(compactionRecords.length, 3, "expected one canonical audit record per preserve checkpoint")
+assert.equal(compactionRecords[0].checkpoint.number, 1)
+assert.equal(compactionRecords[1].checkpoint.number, 2)
+assert.equal(compactionRecords[1].historicalCheckpoints.length, 1)
+assert.equal(compactionRecords[2].checkpoint.number, 3)
+assert.equal(compactionRecords[2].historicalCheckpoints.length, 2)
+assert.notEqual(compactionRecords[0].checkpoint.summaryHash, compactionRecords[1].checkpoint.summaryHash)
+assert.notEqual(compactionRecords[1].checkpoint.summaryHash, compactionRecords[2].checkpoint.summaryHash)
+assert.equal(compactionRecords[1].historicalCheckpoints[0].hash, compactionRecords[0].checkpoint.summaryHash)
+assert.equal(compactionRecords[2].historicalCheckpoints[0].hash, compactionRecords[0].checkpoint.summaryHash)
+assert.equal(compactionRecords[2].historicalCheckpoints[1].hash, compactionRecords[1].checkpoint.summaryHash)
+assert.equal(
+JSON.stringify(compactionRecords[1].contextAfter).split(SUMMARY_TEXT).length - 1,
+2,
+"second context-after audit did not retain both immutable checkpoints",
+)
+assert.ok(
+JSON.stringify(compactionRecords[2].contextBefore).includes("THIRD TOOL OUTPUT"),
+"context-before audit did not include the raw state being compacted",
+)
+assert.ok(
+!JSON.stringify(compactionRecords[2].contextAfter).includes("THIRD TOOL OUTPUT"),
+"context-after audit still contains raw state that should have been compacted",
+)
+assert.ok(Array.isArray(compactionRecords[2].contextIndex.before))
+assert.ok(Array.isArray(compactionRecords[2].contextIndex.after))
+const beforeContextIndex = compactionRecords[2].contextIndex.before
+const afterContextIndex = compactionRecords[2].contextIndex.after
+assert.ok(beforeContextIndex.every((entry: any) => typeof entry.hash === "string"))
+assert.ok(afterContextIndex.every((entry: any) => "sourceEntryId" in entry && "checkpointNumber" in entry))
+const indexedCheckpoints = afterContextIndex.filter((entry: any) => entry.checkpointNumber !== null)
+assert.deepEqual(indexedCheckpoints.map((entry: any) => entry.checkpointNumber), [1, 2, 3])
+assert.ok(indexedCheckpoints.slice(0, 2).every((entry: any) => typeof entry.sourceEntryId === "string"))
+assert.equal(indexedCheckpoints[2].sourceEntryId, null)
+assert.ok(afterContextIndex.filter((entry: any) => entry.role !== "system").every((entry: any) => entry.sourceEntryId !== null || entry.checkpointNumber !== null))
+assert.ok(compactionRecords[2].scope.rawEntryCount > 0)
+assert.equal(compactionRecords[2].scope.rawEntryIds.length, compactionRecords[2].scope.rawEntryCount)
+assert.equal(compactionRecords[2].scope.firstRawEntryId, compactionRecords[2].scope.rawEntryIds[0])
+assert.equal(compactionRecords[2].scope.lastRawEntryId, compactionRecords[2].scope.rawEntryIds.at(-1))
+assert.ok(compactionRecords[1].tokens.providerContextBefore > 0)
+assert.ok(compactionRecords[1].tokens.providerPromptOverhead >= 0)
+assert.ok(compactionRecords[1].tokens.estimatedSystemPrompt > 0)
+assert.ok(compactionRecords[1].tokens.estimatedToolDeclarations > 0)
+assert.ok(compactionRecords[1].tokens.estimatedOtherProviderOverhead >= 0)
+assert.ok(compactionRecords[1].tokens.estimatedContextAfter > 0)
+assert.ok(compactionRecords[1].tokens.preservedUserMessages > 0)
+assert.ok(compactionRecords[1].tokens.preservedAssistantText > 0)
+assert.ok(compactionRecords[1].tokens.newRawCompactable > 0)
+assert.equal(compactionRecords[1].tokens.remainingRawCompactable, 0)
+
+const postContexts = debugRecords.filter((record) => record.kind === "post_compaction_context")
+assert.ok(postContexts.length >= 3, "actual provider context after every preserve compaction was not logged")
+const postThirdRequest = mock.requests[summaryIndexes[2] + 1]
+assert.ok(postThirdRequest)
+const preThirdMessages = mock.requests[summaryIndexes[2] - 1].body.messages ?? []
+const preThirdTools = mock.requests[summaryIndexes[2] - 1].body.tools ?? []
+const postThirdMessages = postThirdRequest.body.messages ?? []
+assert.deepEqual(compactionRecords[2].toolDeclarations, preThirdTools)
+const expectedStablePrefix = sharedPrefixLength(
+rollingMessageHashes(preThirdMessages),
+rollingMessageHashes(postThirdMessages),
+)
+const expectedDivergenceIndex = beforeContextIndex.findIndex(
+(entry: any) => entry.sourceEntryId === compactionRecords[2].scope.firstRawEntryId,
+)
+assert.ok(
+expectedDivergenceIndex >= 0,
+`could not map the first raw branch entry into provider context\n${JSON.stringify({ firstRawEntryId: compactionRecords[2].scope.firstRawEntryId, beforeContextIndex }, null, 1)}`,
+)
+assert.equal(
+expectedStablePrefix,
+expectedDivergenceIndex,
+"actual provider cache divergence did not begin exactly at the first compacted raw tool message",
+)
+const previewDivergence = compactionRecords[2].cachePrefixPreview.firstDivergence
+assert.ok(previewDivergence, "predicted compaction context reported no divergence")
+assert.match(String(previewDivergence.beforeKind), /(tool|reasoning)/)
+assert.equal(previewDivergence.index, expectedDivergenceIndex)
+assert.equal(compactionRecords[2].cachePrefixPreview.firstDivergenceMessage, expectedDivergenceIndex)
+assert.deepEqual(postContexts.at(-1).context.messages, postThirdRequest.body.messages)
+assert.deepEqual(postContexts.at(-1).context.tools, postThirdRequest.body.tools ?? [])
+assert.equal(postContexts.at(-1).branchCheckpoints.length, 3)
+assert.equal(postContexts.at(-1).cachePrefix.stableMessages, expectedStablePrefix)
 } finally {
 mock.close()
 run?.cleanup()

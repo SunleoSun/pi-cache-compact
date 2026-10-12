@@ -54,20 +54,29 @@ test("renderSummaryAsk falls back to the default prompt and appends custom instr
   )
 })
 
-test("renderSummaryAsk has a tool-only mode that never asks to summarize preserved dialogue", () => {
-  const first = renderSummaryAsk({ preserveDialogue: true })
-  assert.match(first, /technical checkpoint ONLY from tool activity/i)
+test("renderSummaryAsk has an append-only tool-checkpoint mode scoped by user message", () => {
+const first = renderSummaryAsk({ preserveDialogue: true })
+assert.match(first, /NEW compact incremental technical checkpoint/i)
+assert.match(first, /Historical Tool Context Checkpoints are immutable preserved context/)
+assert.match(first, /Do NOT repeat, merge, rewrite, update, summarize, or supersede them/)
+assert.match(first, /most recent preceding user message/)
+assert.match(first, /User message N/)
+assert.match(first, /Summarize RESULTS/i)
 assert.match(first, /Do NOT summarize, paraphrase, restate, reinterpret, or quote them/)
 assert.match(first, /thinking\/reasoning is intentionally discarded/i)
-assert.match(first, /claims that appear only in thinking/i)
-assert.doesNotMatch(first, /assistant reasoning\/tool-use state/i)
 assert.doesNotMatch(first, /^## Goal$/m)
 
-  const update = renderSummaryAsk({ preserveDialogue: true, previous: true })
-assert.match(update, /Update the existing technical tool-context checkpoint/)
-assert.match(update, /thinking\/reasoning is intentionally discarded/i)
-assert.doesNotMatch(update, /assistant reasoning\/tool-use state/i)
-assert.doesNotMatch(update, /PRESERVE all existing information from the previous summary/)
+const withHistory = renderSummaryAsk({ preserveDialogue: true, previous: true })
+assert.equal(withHistory, first, "a historical checkpoint must not switch preserve mode into rewrite/update semantics")
+assert.doesNotMatch(withHistory, /Update the existing technical tool-context checkpoint/)
+
+const explicitOrdinals = renderSummaryAsk({
+preserveDialogue: true,
+preserveUserMessageOrdinals: [5, 6],
+})
+assert.match(explicitOrdinals, /absolute user-message ordinal\(s\): 5, 6/)
+assert.match(explicitOrdinals, /Use these exact ordinals/)
+assert.match(explicitOrdinals, /outside the new delta/)
 })
 
 test("activeToolDeclarations keeps only active tools, in Pi's order", () => {

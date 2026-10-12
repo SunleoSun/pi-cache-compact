@@ -1,10 +1,10 @@
 {
   "name": "pi-cache-compact-preserved-messages",
-"version": "1.1.1",
+  "version": "1.1.3",
   "description": "Cache-friendly Pi compaction that preserves historical user messages and visible assistant responses verbatim.",
   "type": "module",
-"license": "MIT",
-"main": "src/extension.ts",
+  "license": "MIT",
+  "main": "src/extension.ts",
   "exports": {
     ".": "./src/extension.ts"
   },
@@ -26,8 +26,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test",
     "test:e2e": "node --test test/e2e.test.ts",
-    "certify": "npm run typecheck && npm test && npm run test:e2e",
-    "prepublishOnly": "npm run typecheck && npm test"
+    "certify": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run certify"
   },
   "keywords": [
     "pi",

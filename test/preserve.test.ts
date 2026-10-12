@@ -2,9 +2,13 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import {
-  PRESERVE_DIALOGUE_MARKER,
-  preservedDialogueMessages,
-  rebuildPreservedDialogue,
+PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
+PRESERVE_DIALOGUE_MARKER,
+preserveDeltaScope,
+preserveDialogueBoundaryEntries,
+preserveDialogueStates,
+preservedDialogueMessages,
+rebuildPreservedDialogue,
 } from "../src/preserve.ts"
 
 function message(id: string, role: string, content: unknown): any {
@@ -56,6 +60,118 @@ test("preservedDialogueMessages exposes exactly the non-compressible dialogue", 
   assert.ok(!JSON.stringify(preserved).includes("discard me"))
   assert.ok(!JSON.stringify(preserved).includes("discard tool output"))
   assert.ok(!JSON.stringify(preserved).includes("call-1"))
+})
+
+test("turn-boundary preserve checkpoint hides tool state from the model without emitting a Pi compaction", () => {
+const branch = [
+message("u1", "user", "USER"),
+message("a1", "assistant", [
+{ type: "thinking", thinking: "discard reasoning" },
+{ type: "text", text: "VISIBLE" },
+{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "x.ts" } },
+]),
+message("t1", "toolResult", [{ type: "text", text: "RAW TOOL OUTPUT" }]),
+]
+
+const drafts = preserveDialogueBoundaryEntries({
+branchEntries: branch as any,
+summary: "TECHNICAL CHECKPOINT",
+tokensBefore: 1234,
+details: { cacheCompact: PRESERVE_DIALOGUE_MARKER },
+})
+
+assert.equal(drafts.some((entry: any) => entry.type === "compaction"), false)
+assert.deepEqual(
+(drafts.find((entry: any) => entry.type === "context_edit" && entry.targetId === "a1") as any)?.replacement,
+{ content: [{ type: "text", text: "VISIBLE" }] },
+)
+assert.equal(
+(drafts.find((entry: any) => entry.type === "context_edit" && entry.targetId === "t1") as any)?.replacement,
+null,
+)
+const checkpoint = drafts.at(-1) as any
+assert.equal(checkpoint.type, "custom_message")
+assert.equal(checkpoint.customType, PRESERVE_DIALOGUE_CHECKPOINT_TYPE)
+assert.equal(checkpoint.display, false)
+assert.equal(checkpoint.details.checkpoint.summary, "TECHNICAL CHECKPOINT")
+})
+
+test("preserveDeltaScope separates multiple user requests and records raw branch boundaries", () => {
+const branch = [
+message("u1", "user", "FIRST REQUEST"),
+message("a1", "assistant", [
+{ type: "text", text: "FIRST VISIBLE" },
+{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "first.ts" } },
+]),
+message("t1", "toolResult", [{ type: "text", text: "FIRST RESULT" }]),
+message("u2", "user", "SECOND REQUEST"),
+message("a2", "assistant", [
+{ type: "thinking", thinking: "discard" },
+{ type: "toolCall", id: "call-2", name: "read", arguments: { path: "second.ts" } },
+]),
+message("t2", "toolResult", [{ type: "text", text: "SECOND RESULT" }]),
+]
+
+const scope = preserveDeltaScope(branch as any)
+assert.deepEqual(scope.coveredUserMessages, [1, 2])
+assert.deepEqual(scope.rawEntryIds, ["a1", "t1", "a2", "t2"])
+assert.equal(scope.firstRawEntryId, "a1")
+assert.equal(scope.lastRawEntryId, "t2")
+assert.equal(scope.rawEntryCount, 4)
+})
+test("a repeated turn-boundary checkpoint appends a new immutable checkpoint and only edits new raw state", () => {
+const priorCheckpoint = {
+type: "custom_message",
+id: "checkpoint-1",
+parentId: null,
+timestamp: "2026-01-01T00:00:03.000Z",
+customType: PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
+content: "## Tool Context Checkpoint\n\nOLD CHECKPOINT",
+display: false,
+details: {
+cacheCompact: PRESERVE_DIALOGUE_MARKER,
+checkpoint: { summary: "OLD CHECKPOINT", tokensBefore: 1000 },
+},
+}
+const branch = [
+message("u1", "user", "OLD USER"),
+message("a1", "assistant", [{ type: "text", text: "OLD ANSWER" }]),
+message("t1", "toolResult", [{ type: "text", text: "OLD RAW TOOL" }]),
+priorCheckpoint,
+message("a2", "assistant", [
+{ type: "text", text: "NEW ANSWER" },
+{ type: "toolCall", id: "call-2", name: "read", arguments: { path: "new.ts" } },
+]),
+message("t2", "toolResult", [{ type: "text", text: "NEW RAW TOOL" }]),
+]
+const sameUserScope = preserveDeltaScope(branch as any)
+assert.deepEqual(sameUserScope.coveredUserMessages, [1])
+assert.deepEqual(sameUserScope.rawEntryIds, ["a2", "t2"])
+
+const drafts = preserveDialogueBoundaryEntries({
+branchEntries: branch as any,
+summary: "NEW CHECKPOINT",
+tokensBefore: 2000,
+details: { cacheCompact: PRESERVE_DIALOGUE_MARKER },
+})
+
+assert.equal(drafts.some((entry: any) => entry.targetId === "checkpoint-1"), false)
+assert.equal(drafts.some((entry: any) => entry.targetId === "t1"), false)
+assert.equal(drafts.some((entry: any) => entry.targetId === "a1"), false)
+assert.equal(drafts.some((entry: any) => entry.targetId === "t2" && entry.replacement === null), true)
+const next = drafts.at(-1) as any
+assert.equal(next.details.checkpoint.summary, "NEW CHECKPOINT")
+assert.equal(next.details.checkpoint.number, 2)
+assert.deepEqual(next.details.checkpoint.coveredUserMessages, [1])
+assert.match(next.content, /Tool Context Checkpoint #2/)
+const withNext = [...branch, { ...next, id: "checkpoint-2", timestamp: "2026-01-01T00:00:06.000Z" }] as any
+assert.deepEqual(preserveDialogueStates(withNext).map((state) => state.summary), ["OLD CHECKPOINT", "NEW CHECKPOINT"])
+assert.deepEqual(preserveDeltaScope(withNext).coveredUserMessages, [])
+const rebuilt = rebuildPreservedDialogue([], withNext)!
+assert.deepEqual(
+rebuilt.filter((item: any) => item.role === "custom").map((item: any) => item.content),
+[priorCheckpoint.content, next.content],
+)
 })
 
 test("compaction removes every pre-compaction tool/reasoning block even from Pi's kept tail", () => {

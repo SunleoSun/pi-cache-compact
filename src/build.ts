@@ -131,52 +131,38 @@ export const PI_TURN_PREFIX_FORMAT = `## Original Request
 export const PI_SPLIT_MARKER = "**Turn Context (split turn):**"
 export const PI_NO_HISTORY = "No prior history."
 
-export const PRESERVE_TOOL_SUMMARY_PROMPT = `Create a compact technical checkpoint ONLY from tool activity, tool results, and tool-derived operational state in the scoped conversation.
+export const PRESERVE_TOOL_SUMMARY_PROMPT = `Create a NEW compact incremental technical checkpoint ONLY from tool activity, tool results, and tool-derived operational state that occurred after the most recent Tool Context Checkpoint in this conversation. If no prior checkpoint exists, cover tool activity from the start of the conversation.
 
-The original user messages and visible assistant responses are preserved verbatim elsewhere and will be reinserted into the model context. Do NOT summarize, paraphrase, restate, reinterpret, or quote them.
+Historical Tool Context Checkpoints are immutable preserved context. Do NOT repeat, merge, rewrite, update, summarize, or supersede them.
+
+The original user messages and visible assistant responses are preserved verbatim elsewhere and remain in the model context. Do NOT summarize, paraphrase, restate, reinterpret, or quote them.
 
 Assistant thinking/reasoning is intentionally discarded. Do NOT preserve it or promote claims that appear only in thinking. Include a fact only when it is evidenced by tool activity/results or by repository/runtime state observed through tools.
 
-Capture only durable technical state learned or produced through tool activity:
-- files, symbols, APIs, schemas, and repository/runtime state that were inspected;
-- edits or writes that were actually made;
-- commands, tests, compiler/linter results, exact errors, and validation evidence;
-- technical findings and unresolved implementation state evidenced by tools;
-- exact file paths, identifiers, commands, and error text when they matter.
+Associate every tool-derived fact with the most recent preceding user message that caused that work. The responsible user message may appear before the most recent checkpoint when the same tool loop continues across checkpoints. Label sections as \"User message N\", where N is that message's absolute order among user-role messages from the start of the conversation. Do not restate the user prompt.
 
-Use this format:
+Summarize RESULTS, findings, produced state, and validation evidence — not a history of tool calls. A statement such as \"Read src/foo.ts\", \"searched for X\", or \"ran tests\" is insufficient unless the action itself is operationally important. Prefer the resulting fact or evidence.
 
-## Tool Context
-### Inspected State
-- [durable facts learned from tools, or "(none)"]
+Examples:
+- weak: \"Read src/foo.ts.\"
+- strong: \"src/foo.ts routes retries through RetryPolicy.nextDelay; no separate retry loop was found.\"
+- weak: \"Ran cargo test.\"
+- strong: \"cargo test -p targets: 214 passed, 5 ignored, 0 failed.\"
 
-### Changes & Validation
-- [changes made and their observed validation, or "(none)"]
-
-### Unresolved Technical State
-- [open tool-evidenced findings/blockers, or "(none)"]
-
-Keep it compact and factual. Do not turn user requirements, assistant prose, or assistant reasoning into summary content.`
-
-export const PRESERVE_TOOL_UPDATE_PROMPT = `Update the existing technical tool-context checkpoint using only new tool activity, tool results, and tool-derived operational state in the scoped conversation.
-
-The original user messages and visible assistant responses are preserved verbatim elsewhere. Do NOT summarize, paraphrase, restate, reinterpret, or quote them.
-
-Assistant thinking/reasoning is intentionally discarded. Do NOT preserve it or promote claims that appear only in thinking. Preserve still-current tool-evidenced facts from the prior checkpoint, add new tool-derived facts, update changed repository/runtime state, and remove only technical facts that new tool evidence makes obsolete.
-
-Use this format:
+For each user message that has scoped tool activity, use this format:
 
 ## Tool Context
-### Inspected State
-- [durable facts learned from tools, or "(none)"]
+### User message N
+#### Findings
+- [tool-evidenced results and durable facts, or \"(none)\"]
 
-### Changes & Validation
-- [changes made and their observed validation, or "(none)"]
+#### Changes & Validation
+- [changes actually made plus observed validation/evidence, or \"(none)\"]
 
-### Unresolved Technical State
-- [open tool-evidenced findings/blockers, or "(none)"]
+#### Unresolved
+- [open tool-evidenced findings/blockers, or \"(none)\"]
 
-Keep it compact and factual. Preserve exact file paths, identifiers, commands, and error text when they matter.`
+Omit user messages with no scoped tool activity. Keep exact file paths, identifiers, commands, counts, output values, and error text when they materially support a result. Keep the checkpoint compact and factual.`
 
 export type SummaryPromptOptions = {
 /** Replace the default handoff instruction. */
@@ -218,7 +204,9 @@ export type SummaryAskArgs = SummaryPromptOptions & {
   split?: { boundary: SummaryBoundary; hasHistory: boolean }
   /** Extra focus from the caller (`customInstructions`). */
   focus?: string
-}
+  /** Absolute user-message ordinals that own tool activity in this preserve delta. */
+  preserveUserMessageOrdinals?: readonly number[]
+  }
 
 /**
  * Compose the user turn that asks for the summary.
@@ -234,12 +222,10 @@ export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
   const base =
     args.summaryPrompt?.trim() ||
     (args.preserveDialogue
-      ? args.previous
-        ? PRESERVE_TOOL_UPDATE_PROMPT
-        : PRESERVE_TOOL_SUMMARY_PROMPT
-      : args.previous
-        ? PI_UPDATE_SUMMARY_PROMPT
-        : PI_SUMMARY_PROMPT)
+    ? PRESERVE_TOOL_SUMMARY_PROMPT
+    : args.previous
+    ? PI_UPDATE_SUMMARY_PROMPT
+    : PI_SUMMARY_PROMPT)
   const parts = [
     base,
     // Pi's prompt does not say this (Pi declares no tools at all, so its model
@@ -251,7 +237,11 @@ export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
   ]
   const focus = args.focus?.trim()
   if (focus) parts.push(`Additional focus: ${focus}`)
-
+  if (args.preserveDialogue && args.preserveUserMessageOrdinals?.length) {
+  parts.push(
+  `This checkpoint contains new tool activity for absolute user-message ordinal(s): ${args.preserveUserMessageOrdinals.join(", ")}. Use these exact ordinals in the \"### User message N\" headings. If tool activity continues a user turn that began before the latest checkpoint, its original user message may be outside the new delta; keep using the listed absolute ordinal instead of renumbering from the visible delta.`,
+  )
+  }
   const scope = (boundary: SummaryBoundary, closing: string): string =>
     `Cover the conversation only up to and including the ${boundary.role} message that begins:\n\n"${boundary.snippet}"\n\n${closing}`
 
@@ -422,6 +412,8 @@ export function planSummaryRequest(args: {
   modelMaxTokens?: number
   /** Tokens of state actually replaced by the new checkpoint, when narrower than droppedMessages. */
   reclaimedTokens?: number
+  /** Absolute user-message ordinals covered by this preserve delta. */
+  preserveUserMessageOrdinals?: readonly number[]
   }): SummaryRequestPlan {
   // Resolve the output ceiling once, from Pi's rule bounded by what this
   // compaction reclaims, so the fit checks and the request agree on it.
@@ -446,7 +438,8 @@ export function planSummaryRequest(args: {
       preserveDialogue: args.options.preserveDialogue,
       previous: Boolean(args.previousSummary),
       focus: args.customInstructions,
-    }),
+      preserveUserMessageOrdinals: args.preserveUserMessageOrdinals,
+      }),
     })
 
   const droppedCount = args.droppedMessages.length
@@ -524,12 +517,13 @@ args.options.preserveDialogue === true
     rewindFallback,
     requestFits,
     ask: renderSummaryAsk({
-      summaryPrompt: args.options.summaryPrompt,
-      preserveDialogue: args.options.preserveDialogue,
-      previous: Boolean(args.previousSummary),
-      focus: args.customInstructions,
-      ...(boundary ? { boundary } : undefined),
-      ...(split ? { split } : undefined),
+    summaryPrompt: args.options.summaryPrompt,
+    preserveDialogue: args.options.preserveDialogue,
+    previous: Boolean(args.previousSummary),
+    focus: args.customInstructions,
+    preserveUserMessageOrdinals: args.preserveUserMessageOrdinals,
+    ...(boundary ? { boundary } : undefined),
+    ...(split ? { split } : undefined),
     }),
     shape: chosen.shape,
     ...(boundary ? { boundary } : undefined),

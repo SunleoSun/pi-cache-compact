@@ -268,12 +268,81 @@ test("preserveDialogue proactively compacts at 90% between tool turns without ab
 
     assert.equal(calls.compact.length, 0, "dynamic compaction must not call ctx.compact() and abort the run")
     assert.equal(calls.complete.length, 1)
-    assert.equal(result.entries.at(-1).type, "compaction")
-    assert.equal(result.entries.at(-1).firstKeptEntryId, null)
+    assert.equal(result.entries.some((entry: any) => entry.type === "compaction"), false, "dynamic preserve must not emit Pi's transcript-clearing compaction entry")
+    const assistantEdit = result.entries.find((entry: any) => entry.type === "context_edit" && entry.targetId === "a1")
+    const toolEdit = result.entries.find((entry: any) => entry.type === "context_edit" && entry.targetId === "t1")
+    const checkpoint = result.entries.at(-1)
+    assert.deepEqual(assistantEdit.replacement, { content: [{ type: "text", text: "PERMANENT VISIBLE ANSWER" }] })
+    assert.equal(toolEdit.replacement, null)
+    assert.equal(checkpoint.type, "custom_message")
+    assert.equal(checkpoint.display, false)
+    assert.equal(checkpoint.customType, "cache-compact-preserve-checkpoint")
     assert.match(JSON.stringify(calls.complete[0].context.messages), /compressible tool output/)
   } finally {
     ws.cleanup()
   }
+})
+
+test("preserveDialogue checkpoints before Pi's native threshold can clear the transcript", async () => {
+const ws = tempWorkspace({ preserveDialogue: true })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const branchEntries = [
+{ type: "message", id: "u1", message: { role: "user", content: "KEEP USER", timestamp: 1 } },
+{
+type: "message",
+id: "a1",
+message: assistant([
+{ type: "text", text: "KEEP ANSWER" },
+{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
+] as any),
+},
+{
+type: "message",
+id: "t1",
+message: {
+role: "toolResult",
+toolCallId: "call-1",
+toolName: "read",
+content: [{ type: "text", text: "compact me".repeat(100) }],
+isError: false,
+timestamp: 3,
+},
+},
+]
+const { handlers, ctx, calls } = setup({
+cwd: ws.cwd,
+branchEntries,
+messages: [
+{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+...branchEntries.map((entry: any) => entry.message),
+],
+contextUsage: { tokens: 34_000, contextWindow: 50_000, percent: 68 },
+model: { provider: "mock", id: "test-model", contextWindow: 50_000 },
+hasUI: true,
+})
+
+const result = await handlers.get("turn_end")!(
+{
+type: "turn_end",
+turnIndex: 0,
+message: branchEntries[1].message,
+toolResults: [branchEntries[2].message],
+messageEntryId: "a1",
+toolResultEntryIds: ["t1"],
+entries: [],
+continue: false,
+},
+ctx,
+)
+
+assert.equal(calls.complete.length, 1)
+assert.equal(result.entries.some((entry: any) => entry.type === "compaction"), false)
+assert.equal(result.entries.at(-1).customType, "cache-compact-preserve-checkpoint")
+assert.match(calls.notifications.at(-1)!.message, /normal \(before Pi threshold\)/)
+} finally {
+ws.cleanup()
+}
 })
 
 test("preserveDialogue never proactively compacts a tool-free final turn", async () => {
@@ -386,7 +455,7 @@ test("preserveDialogue reports the trigger branch, token split, and final tools/
     ctx,
     )
 
-    assert.equal(result.entries.at(-1).type, "compaction")
+    assert.equal(result.entries.at(-1).type, "custom_message")
     assert.equal(calls.compact.length, 0)
     assert.equal(calls.complete.length, 1)
     const summaryRequestText = JSON.stringify(calls.complete[0].context.messages)
@@ -394,25 +463,86 @@ test("preserveDialogue reports the trigger branch, token split, and final tools/
     const preserveAsk = calls.complete[0].context.messages.at(-1).content[0].text
     assert.doesNotMatch(preserveAsk, /later message\(s\) stay in the context verbatim/)
     assert.match(calls.notifications[0].message, /normal \(dynamic 90%\)/)
-    assert.match(calls.notifications[0].message, /preserved messages: \d+ tok/)
-    assert.match(calls.notifications[0].message, /compactable messages: \d+ tok/)
+    assert.match(calls.notifications[0].message, /preserved dialogue: \d+ tok/)
+    assert.match(calls.notifications[0].message, /historical checkpoints: \d+ tok \(0\)/)
+    assert.match(calls.notifications[0].message, /new raw compactable: \d+ tok/)
     assert.match(calls.notifications[0].message, /context 92000\/100000 tok/)
 
-    assert.match(calls.notifications.at(-1)!.message, /compact complete: normal \(dynamic 90%\)/)
-assert.match(calls.notifications.at(-1)!.message, /old summary: \d+ tok/)
-assert.match(calls.notifications.at(-1)!.message, /new raw compactable state: \d+ tok/)
-assert.match(calls.notifications.at(-1)!.message, /total compacted state: \d+ tok/)
-assert.match(calls.notifications.at(-1)!.message, /summary size: \d+ tok/)
-assert.match(calls.notifications.at(-1)!.message, /compressed: \d+ tok/)
-assert.match(calls.notifications.at(-1)!.message, /compression: [0-9.]+x/)
-assert.match(calls.notifications.at(-1)!.message, /preserved messages: \d+ tok/)
-assert.match(calls.notifications.at(-1)!.message, /total new context: ~\d+ tok/)
-assert.doesNotMatch(calls.notifications.at(-1)!.message, /recent raw tail/i)
-assert.match(calls.notifications.at(-1)!.message, /tools\/results summary:/)
-assert.match(calls.notifications.at(-1)!.message, /MOCK SUMMARY/)
+    const completeNotice = calls.notifications.at(-1)!.message
+    assert.match(completeNotice, /compact complete: normal \(dynamic 90%\)/)
+    assert.match(completeNotice, /context before: 92000 tok/)
+    assert.match(completeNotice, /context after: ~\d+ tok/)
+    assert.match(completeNotice, /reclaimed: ~\d+ tok/)
+    assert.match(completeNotice, /preserved dialogue: \d+ tok/)
+    assert.match(completeNotice, /user messages: ~\d+ tok/)
+    assert.match(completeNotice, /assistant text: ~\d+ tok/)
+    assert.match(completeNotice, /historical checkpoints: \d+ tok \(0\)/)
+    assert.match(completeNotice, /new raw compactable: \d+ tok/)
+    assert.match(completeNotice, /tool calls: ~\d+ tok/)
+    assert.match(completeNotice, /tool results: ~\d+ tok/)
+    assert.match(completeNotice, /reasoning: ~\d+ tok/)
+    assert.match(completeNotice, /new checkpoint #1: \d+ tok/)
+    assert.match(completeNotice, /system prompt: ~\d+ tok/)
+    assert.match(completeNotice, /tool declarations: ~\d+ tok/)
+    assert.match(completeNotice, /other provider overhead: ~\d+ tok/)
+    assert.match(completeNotice, /checkpoint user messages: 1/)
+    assert.match(completeNotice, /compression: [0-9.]+x/)
+    assert.match(completeNotice, /tools\/results summary:/)
+    assert.match(completeNotice, /MOCK SUMMARY/)
   } finally {
     ws.cleanup()
   }
+})
+
+test("preserveDialogue cancels Pi threshold without re-summarizing when the checkpoint already owns all compactable state", async () => {
+const ws = tempWorkspace({ preserveDialogue: true })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const checkpointDetails = {
+cacheCompact: { mode: "preserve-dialogue-v1", version: 1 },
+checkpoint: { summary: "TOOLS ALREADY CHECKPOINTED", tokensBefore: 34_000 },
+}
+const branchEntries = [
+{ type: "message", id: "u1", message: { role: "user", content: "KEEP USER", timestamp: 1 } },
+{ type: "message", id: "a1", message: assistant([{ type: "text", text: "KEEP ANSWER" }] as any) },
+{
+type: "custom_message",
+id: "checkpoint-1",
+customType: "cache-compact-preserve-checkpoint",
+content: "## Tool Context Checkpoint\n\nTOOLS ALREADY CHECKPOINTED",
+display: false,
+details: checkpointDetails,
+timestamp: "2026-01-01T00:00:02.000Z",
+},
+]
+const checkpointMessage = {
+role: "custom",
+customType: "cache-compact-preserve-checkpoint",
+content: "## Tool Context Checkpoint\n\nTOOLS ALREADY CHECKPOINTED",
+display: false,
+details: checkpointDetails,
+timestamp: 3,
+}
+const { handler, ctx, calls } = setup({
+cwd: ws.cwd,
+branchEntries,
+messages: [
+{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+branchEntries[0].message,
+branchEntries[1].message,
+checkpointMessage,
+],
+contextUsage: { tokens: 34_000, contextWindow: 50_000, percent: 68 },
+hasUI: true,
+})
+
+const result = await handler(event({ reason: "threshold", branchEntries: branchEntries as any }), ctx)
+assert.deepEqual(result, { cancel: true })
+assert.equal(calls.complete.length, 0)
+assert.equal(calls.notifications.length, 0)
+} finally {
+ws.cleanup()
+}
 })
 
 test("preserveDialogue labels Pi threshold compaction as emergency", async () => {
@@ -542,7 +672,10 @@ test("a later preserveDialogue compaction summarizes the same restored dialogue 
       timestamp: 3,
     }
     const keptOne = { role: "user", content: "KEPT ONE", timestamp: 4 }
-    const afterOne = assistant([{ type: "text", text: "AFTER ONE" }])
+    const afterOne = assistant([
+    { type: "text", text: "AFTER ONE" },
+    { type: "toolCall", id: "new-tool", name: "read", arguments: { path: "new.ts" } },
+    ] as any)
     const keepTwo = { role: "user", content: "KEEP TWO", timestamp: 6 }
     const branchEntries = [
       {
@@ -634,7 +767,7 @@ test("a later preserveDialogue compaction summarizes the same restored dialogue 
     assert.ok(serialized.includes("EXACT OLD RESPONSE"))
     assert.ok(serialized.includes("old tool state"))
     assert.ok(!serialized.includes("old-tool"))
-    assert.match(summaryContext.at(-1).content[0].text, /Update the existing technical tool-context checkpoint/)
+    assert.match(summaryContext.at(-1).content[0].text, /NEW compact incremental technical checkpoint/)
   } finally {
     ws.cleanup()
   }
@@ -726,7 +859,7 @@ handlers.get("session_compact_failed")!(
 ctx,
 )
 assert.match(calls.notifications.at(-1)!.message, /emergency \(Pi threshold\)/)
-assert.match(calls.notifications.at(-1)!.message, /full preserve tool-state summary no longer fits/)
+assert.match(calls.notifications.at(-1)!.message, /only the rewinding shape fits/)
 } finally {
 ws.cleanup()
 }
@@ -990,15 +1123,25 @@ function readRecords(file: string): any[] {
 
 test("debug records the compaction lifecycle to debugFile", async () => {
   const debugFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cc-dbg-")), "debug.jsonl")
-  const ws = tempWorkspace({ debug: true, debugFile })
+  const ws = tempWorkspace({ preserveDialogue: true, debug: true, debugFile })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
   try {
-    const { handler, ctx } = setup({ cwd: ws.cwd })
+    const { handler, providerHandler, ctx } = setup({ cwd: ws.cwd })
+    providerHandler(
+    { type: "before_provider_request", payload: { model: "m", messages: [{ role: "system", content: "SYSTEM PROMPT" }, { role: "user", content: "hello from the session" }] } },
+    ctx,
+    )
     await handler(event(), ctx)
+    providerHandler(
+    { type: "before_provider_request", payload: { model: "m", messages: [{ role: "system", content: "SYSTEM PROMPT" }, { role: "user", content: "hello from the session" }, { role: "user", content: "after checkpoint" }] } },
+    ctx,
+    )
 
     const records = readRecords(debugFile)
     const start = records.find((r) => r.kind === "summary_start")
     const result = records.find((r) => r.kind === "summary_result")
+    const audit = records.find((r) => r.kind === "preserve_compaction")
+    const post = records.find((r) => r.kind === "post_compaction_context")
     assert.ok(start, "no summary_start record")
     assert.equal(start.sessionId, "sess-1")
     assert.equal(start.askHash.length, 12)
@@ -1007,6 +1150,28 @@ test("debug records the compaction lifecycle to debugFile", async () => {
     assert.equal(result.chars, "MOCK SUMMARY".length)
     assert.equal(result.cacheRead, 5)
     assert.equal(typeof result.durationMs, "number")
+    assert.ok(audit, "no canonical preserve_compaction audit record")
+    assert.equal(audit.checkpoint.number, 1)
+    assert.ok(Array.isArray(audit.contextBefore))
+    assert.ok(Array.isArray(audit.contextAfter))
+    assert.ok(Array.isArray(audit.contextIndex.before))
+    assert.ok(Array.isArray(audit.contextIndex.after))
+    assert.equal(typeof audit.contextIndex.before[0]?.estimatedTokens, "number")
+    assert.ok(Array.isArray(audit.toolDeclarations))
+    assert.equal(typeof audit.tokens.providerContextBefore, "number")
+    assert.equal(typeof audit.tokens.providerPromptOverhead, "number")
+    assert.equal(typeof audit.tokens.estimatedSystemPrompt, "number")
+    assert.equal(typeof audit.tokens.estimatedToolDeclarations, "number")
+    assert.equal(typeof audit.tokens.estimatedOtherProviderOverhead, "number")
+    assert.equal(typeof audit.tokens.estimatedContextAfter, "number")
+    assert.equal(typeof audit.tokens.preservedUserMessages, "number")
+    assert.equal(typeof audit.tokens.preservedAssistantText, "number")
+    assert.equal(typeof audit.tokens.newRawCompactable, "number")
+    assert.equal(audit.tokens.remainingRawCompactable, 0)
+    assert.ok(Array.isArray(audit.scope.rawEntryIds))
+    assert.ok(post, "no actual post_compaction_context record")
+    assert.ok(Array.isArray(post.context.messages))
+    assert.equal(typeof post.cachePrefix.stableMessages, "number")
   } finally {
     ws.cleanup()
   }
@@ -1077,16 +1242,20 @@ test("provider requests are fingerprinted and the in-flight summary is tagged", 
   }
 })
 
-test("provider handler stays silent and never throws without debug", () => {
-  const ws = tempWorkspace()
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const { providerHandler, ctx } = setup({ cwd: ws.cwd })
-    assert.doesNotThrow(() => providerHandler({ type: "before_provider_request", payload: undefined }, ctx))
-    assert.doesNotThrow(() => providerHandler({ type: "before_provider_request", payload: { messages: [{}] } }, ctx))
-  } finally {
-    ws.cleanup()
-  }
+test("debug: false never creates the configured log file", () => {
+const debugDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-debug-off-"))
+const debugFile = path.join(debugDir, "debug.jsonl")
+const ws = tempWorkspace({ debug: false, debugFile })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const { providerHandler, ctx } = setup({ cwd: ws.cwd })
+assert.doesNotThrow(() => providerHandler({ type: "before_provider_request", payload: undefined }, ctx))
+assert.doesNotThrow(() => providerHandler({ type: "before_provider_request", payload: { messages: [{}] } }, ctx))
+assert.equal(fs.existsSync(debugFile), false)
+} finally {
+ws.cleanup()
+fs.rmSync(debugDir, { recursive: true, force: true })
+}
 })
 
 test("debugPayloads dumps live_before, summarization, and live_after", async () => {

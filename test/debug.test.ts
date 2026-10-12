@@ -5,6 +5,7 @@ import os from "node:os"
 import path from "node:path"
 
 import {
+  DEBUG_FILE_MAX_BYTES,
   DebugLogger,
   fingerprintPayload,
   snapshot,
@@ -97,6 +98,70 @@ test("DebugLogger appends JSONL only when enabled with a file", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("DebugLogger keeps valid JSONL under the 1 MiB rolling cap", () => {
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cache-compact-cap-"))
+const file = path.join(dir, "debug.jsonl")
+try {
+const logger = new DebugLogger(true, file)
+for (let index = 0; index < 160; index += 1) {
+logger.record("chunk", { index, text: "x".repeat(10_000) })
+}
+assert.ok(fs.statSync(file).size <= DEBUG_FILE_MAX_BYTES)
+const lines = fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line) as any)
+assert.ok(lines.length > 0)
+assert.equal(lines.at(-1).index, 159)
+assert.ok(lines[0].index > 0, "oldest records should be evicted")
+} finally {
+fs.rmSync(dir, { recursive: true, force: true })
+}
+})
+
+test("DebugLogger rolls canonical preserve_compaction records without losing the newest audit", () => {
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cache-compact-audit-cap-"))
+const file = path.join(dir, "debug.jsonl")
+try {
+const logger = new DebugLogger(true, file)
+for (let checkpoint = 1; checkpoint <= 18; checkpoint += 1) {
+const content = `checkpoint-${checkpoint}-` + "x".repeat(35_000)
+logger.record("preserve_compaction", {
+checkpoint: { number: checkpoint },
+contextBefore: [{ role: "tool", content }],
+contextAfter: [{ role: "custom", content: `summary-${checkpoint}` }],
+tokens: { providerContextBefore: 50_000, estimatedContextAfter: 10_000 },
+})
+logger.record("post_compaction_context", {
+checkpointNumber: checkpoint,
+context: { messages: [{ role: "custom", content: `summary-${checkpoint}` }], tools: [] },
+})
+}
+
+assert.ok(fs.statSync(file).size <= DEBUG_FILE_MAX_BYTES)
+const records = fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line) as any)
+assert.ok(records.length > 0)
+assert.ok(records.every((record) => typeof record.kind === "string"))
+const latestAudit = [...records].reverse().find((record) => record.kind === "preserve_compaction")
+const latestPost = [...records].reverse().find((record) => record.kind === "post_compaction_context")
+assert.equal(latestAudit?.checkpoint?.number, 18)
+assert.equal(latestPost?.checkpointNumber, 18)
+} finally {
+fs.rmSync(dir, { recursive: true, force: true })
+}
+})
+test("DebugLogger replaces a single oversize record with a bounded marker", () => {
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cache-compact-oversize-"))
+const file = path.join(dir, "debug.jsonl")
+try {
+new DebugLogger(true, file).record("huge", { text: "x".repeat(DEBUG_FILE_MAX_BYTES + 100_000) })
+assert.ok(fs.statSync(file).size <= DEBUG_FILE_MAX_BYTES)
+const record = JSON.parse(fs.readFileSync(file, "utf8").trim()) as any
+assert.equal(record.kind, "log_record_oversize")
+assert.equal(record.originalKind, "huge")
+assert.equal(record.limitBytes, DEBUG_FILE_MAX_BYTES)
+} finally {
+fs.rmSync(dir, { recursive: true, force: true })
+}
 })
 
 test("redactHeaders hides secrets but keeps header names visible", () => {
