@@ -139,7 +139,6 @@ Example:
 | `toolChoice` | Summary request tool choice: `none` or `auto`; default `none`. Tool declarations remain for prefix identity. |
 | `continuation` | Prefer a forward continuation of the cached conversation. Default `true`. |
 | `rewindWhenNeeded` | Permit dropped-span rewind when no continuation fits. Default `false`. |
-| `deferAfterCacheMiss` | Back off after a large continuation cache miss. Default `true`. |
 | `debug` | Master debug switch. `false` (default) disables stderr/structured debug output and never creates/touches `debugFile`. |
 | `debugFile` | Absolute JSONL path for structured diagnostics. The file is written only when `debug: true`. |
 | `debugPayloads` | Legacy optional full payload dumps around compaction for `compare-dumps.mjs`. |
@@ -147,6 +146,8 @@ Example:
 ## Debugging and observability
 
 `debugFile` is written only when `debug: true` and a path is configured; `debug: false` never creates or touches it. It is a **rolling JSONL file with a hard 1 MiB limit**. Before appending a record that would exceed the limit, the logger evicts the oldest complete JSONL records. If one record alone is larger than 1 MiB, it is replaced by a small `log_record_oversize` marker. The logger never throws into the compaction path. The extension itself performs no other runtime filesystem writes; Pi still persists its own normal session/transcript files.
+
+Provider cache metrics such as `cacheRead` and `cacheWrite` are observability only. They are logged, but never suppress, defer, retry-gate, or otherwise reshape compaction.
 
 The canonical records are:
 

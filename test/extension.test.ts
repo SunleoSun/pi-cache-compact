@@ -1568,7 +1568,7 @@ function withUsage(usage: Record<string, number> & { content?: any[] }): any {
   }
 }
 
-test("a continuation that missed the cache defers the next compaction to Pi", async () => {
+test("a cold continuation miss does not disable the next compaction", async () => {
   const debugFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cc-defer-")), "debug.jsonl")
   const ws = tempWorkspace({ debug: true, debugFile })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
@@ -1582,79 +1582,14 @@ test("a continuation that missed the cache defers the next compaction to Pi", as
     assert.equal(first.compaction.summary, "MOCK SUMMARY")
     assert.equal(calls.complete.length, 1)
 
-    // The next compaction would pay the same full prefill, so Pi's small
-    // truncated summary is the cheaper option.
-    assert.equal(await handler(event(), ctx), undefined)
-    assert.equal(calls.complete.length, 1, "the continuation was attempted again after a miss")
+    // Cache miss is diagnostic only; the next compaction still runs.
+    const second = (await handler(event(), ctx)) as any
+    assert.equal(second.compaction.summary, "MOCK SUMMARY")
+    assert.equal(calls.complete.length, 2, "cache miss changed future compaction behavior")
     assert.ok(
-      readRecords(debugFile).some((r) => /missed the cache/.test(r.kind)),
-      "no deferral record",
+     readRecords(debugFile).some((r) => r.kind === "summary_result" && r.cacheRead === 0),
+     "cache miss was not retained as diagnostics",
     )
-  } finally {
-    ws.cleanup()
-  }
-})
-
-test("preserveDialogue cancels the next compaction after a large cache miss", async () => {
-  const ws = tempWorkspace({ preserveDialogue: true })
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const { handler, ctx, calls } = setup({
-      cwd: ws.cwd,
-      response: async () => withUsage({ input: 100_000, output: 500, cacheRead: 0 }),
-    })
-    const first = (await handler(event(), ctx)) as any
-    assert.equal(first.compaction.details.cacheCompact.mode, "preserve-dialogue-v1")
-    assert.deepEqual(await handler(event(), ctx), { cancel: true })
-    assert.equal(calls.complete.length, 1, "a cold continuation was retried instead of cancelling")
-  } finally {
-    ws.cleanup()
-  }
-})
-
-test("a continuation that hit the cache keeps being used", async () => {
-  const ws = tempWorkspace()
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const { handler, ctx, calls } = setup({
-      cwd: ws.cwd,
-      response: async () => withUsage({ input: 120, output: 500, cacheRead: 108_000 }),
-    })
-    await handler(event(), ctx)
-    await handler(event(), ctx)
-    assert.equal(calls.complete.length, 2, "a cache hit must not disable the continuation")
-  } finally {
-    ws.cleanup()
-  }
-})
-
-test("a miss is cheap to ignore when the prompt was small", async () => {
-  const ws = tempWorkspace()
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const { handler, ctx, calls } = setup({
-      cwd: ws.cwd,
-      response: async () => withUsage({ input: 800, output: 100, cacheRead: 0 }),
-    })
-    await handler(event(), ctx)
-    await handler(event(), ctx)
-    assert.equal(calls.complete.length, 2, "a small miss should not disable the continuation")
-  } finally {
-    ws.cleanup()
-  }
-})
-
-test("deferAfterCacheMiss: false always tries the continuation", async () => {
-  const ws = tempWorkspace({ deferAfterCacheMiss: false })
-  process.env.PI_CODING_AGENT_DIR = ws.agentDir
-  try {
-    const { handler, ctx, calls } = setup({
-      cwd: ws.cwd,
-      response: async () => withUsage({ input: 100_000, output: 500, cacheRead: 0 }),
-    })
-    await handler(event(), ctx)
-    await handler(event(), ctx)
-    assert.equal(calls.complete.length, 2)
   } finally {
     ws.cleanup()
   }
@@ -1719,12 +1654,12 @@ test("a split turn asks for Pi's two-part artifact", async () => {
   }
 })
 
-test("no retry when the first attempt missed the cache (a retry would re-prefill)", async () => {
+test("a cold cache miss does not suppress the unusable-summary retry", async () => {
   const ws = tempWorkspace()
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
   try {
-    // Empty reply *and* a cold read of a large prompt: retrying would pay the
-    // full prefill again, so the extension hands over to Pi instead.
+    // Cache usage is diagnostic only, so even a large cold request gets the same
+    // one deterministic retry as a cache hit.
     const { handler, ctx, calls } = setup({
       cwd: ws.cwd,
       response: async () =>
@@ -1736,7 +1671,7 @@ test("no retry when the first attempt missed the cache (a retry would re-prefill
         } as any),
     })
     assert.equal(await handler(event(), ctx), undefined)
-    assert.equal(calls.complete.length, 1, "retried despite a cold cache")
+    assert.equal(calls.complete.length, 2, "cache miss incorrectly suppressed the retry")
   } finally {
     ws.cleanup()
   }

@@ -104,20 +104,7 @@ preserveDialogue?: boolean
    * a server that caches arbitrary shared prefixes.
    */
   rewindWhenNeeded?: boolean
-  /**
-   * Let Pi's own (small, truncated) summary take the next compaction after a
-   * continuation missed the cache. Default true.
-   *
-   * Reusing the conversation's cache is nearly free, but only while the server
-   * still holds it. When it does not, the continuation is a *large* cold
-   * prefill (the whole conversation, minutes on a shared box) while Pi's default
-   * is a small one built from a truncated transcript (seconds). The extension
-   * knows which happened — its own summary response reports how much it read
-   * from cache — so after a miss it steps aside for a while rather than paying
-   * the full prefill again. Set false to always try the continuation.
-   */
-  deferAfterCacheMiss?: boolean
-  /** Master debug switch. Default false; when false, debugFile is never created or touched. */
+/** Master debug switch. Default false; when false, debugFile is never created or touched. */
   debug?: boolean
   /**
    * JSONL file that structured debug records are appended to (requires
@@ -212,8 +199,7 @@ if (typeof raw.preserveDialogue === "boolean") options.preserveDialogue = raw.pr
   const choice = toolChoice(raw.toolChoice)
   if (choice) options.toolChoice = choice
   if (typeof raw.continuation === "boolean") options.continuation = raw.continuation
-  if (typeof raw.deferAfterCacheMiss === "boolean") options.deferAfterCacheMiss = raw.deferAfterCacheMiss
-  if (typeof raw.rewindWhenNeeded === "boolean") options.rewindWhenNeeded = raw.rewindWhenNeeded
+if (typeof raw.rewindWhenNeeded === "boolean") options.rewindWhenNeeded = raw.rewindWhenNeeded
   if (typeof raw.debug === "boolean") options.debug = raw.debug
   if (typeof raw.debugFile === "string" && raw.debugFile.trim()) {
     options.debugFile = raw.debugFile.trim()

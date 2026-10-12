@@ -21,6 +21,7 @@ test("parseOptions keeps valid fields and drops unknown or wrongly typed ones", 
       debug: true,
       debugFile: "  /tmp/cc.jsonl  ",
       debugPayloads: true,
+      deferAfterCacheMiss: true,
       nonsense: "ignored",
     }),
     {

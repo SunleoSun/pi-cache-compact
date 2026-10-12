@@ -40,6 +40,7 @@ A Pi extension that makes compaction cache-friendly while preserving the human c
 | Preserve mode compacts all new tool traffic in the delta | Tool calls/results/reasoning created after the latest checkpoint must be absorbed before success. If the valid full-delta request cannot be made, fail closed. |
 | A rewind is opt-in (`rewindWhenNeeded`, `continuation: false`) | Rewinds lose append-only cache reuse. Preserve mode cancels rather than silently taking a lossy fallback. |
 | Bad summaries are never persisted | Reject truncated, aborted, tool-calling, or empty-after-retry replies. Preserve mode cancels rather than delegating to Pi's lossy summary. |
+| Cache hit/miss metrics are diagnostics only | `cacheRead`, `cacheWrite`, and cold/warm outcomes never suppress, defer, or reshape a summary/checkpoint. |
 | Provider/debug hooks never throw or mutate provider payloads accidentally | Observability must not affect compaction. |
 | `debugFile` is rolling JSONL capped at 1 MiB | `preserve_compaction` is a self-contained audit with predicted context before/after, per-message hashes/kinds/token estimates, raw delta entry IDs, checkpoint hashes, complete token accounting and divergence diagnostics; `post_compaction_context` records the actual next provider context/prefix. Oldest complete records are evicted. |
 | `src/build.ts` stays pure | Unit tests load it without booting Pi. Provider/message conversion remains in `extension.ts`. |

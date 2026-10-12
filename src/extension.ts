@@ -91,19 +91,6 @@ function loggerFor(options: CacheCompactOptions): DebugLogger {
 }
 
 /**
- * A prompt below this many tokens is cheap enough to re-prefill cold that a
- * cache miss tells us nothing worth acting on.
- */
-const CACHE_MISS_MIN_PROMPT_TOKENS = 4096
-
-/**
- * How long a cache miss suppresses the continuation. Long enough to cover the
- * busy spell that caused it, short enough that a session running long enough for
- * another compaction gets a fresh attempt.
- */
-const DEFER_AFTER_MISS_MS = 15 * 60 * 1000
-
-/**
  * Compact description of an assistant reply's blocks, for the debug file. A
  * reply that "stopped" with no text block is the failure this exists to
  * explain: it means the answer never left the reasoning channel, so the counts
@@ -520,11 +507,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   // of the (possibly oversized) whole conversation. A count, never content.
   const liveRequestCounts = new Map<string, number>()
 
-  // Whether the last summarization for a session read anything from the cache.
-  // A continuation that misses means the server no longer holds the
-  // conversation, and then the whole-context request is the *expensive* option
-  // — far more so than Pi's little truncated prompt. See `deferAfterCacheMiss`.
-  const lastSummaryOutcome = new Map<string, { at: number; missed: boolean }>()
+  // Provider cache usage is observational only and never changes compaction behavior.
 
 // Preserve-aware boundary checkpoints are asynchronous. Keep one in flight
 // per session so no overlapping boundary work can race the same branch.
@@ -1041,22 +1024,6 @@ notify(ctx, `[cache-compact] ${branch}`, event.reason === "overflow" ? "warning"
 
     const summarizer = resolveSummarizer(ctx, options, model)
 
-    // A previous continuation that read nothing from cache means the checkpoint
-    // is gone, and paying a full cold prefill of the whole conversation is worse
-    // than Pi's small truncated prompt. Step aside for a while.
-    const prior = lastSummaryOutcome.get(sessionId)
-    if (
-      options.deferAfterCacheMiss !== false &&
-      prior?.missed === true &&
-      Date.now() - prior.at < DEFER_AFTER_MISS_MS
-    ) {
-      return preserveFallback("previous continuation missed the cache", {
-        sessionId,
-        missedAt: new Date(prior.at).toISOString(),
-        tokensBefore: event.preparation.tokensBefore,
-      })
-    }
-
 // Preserve mode has a stronger semantic boundary than Pi's native cut:
 // every tool interaction that exists *now* must be absorbed into the
 // technical checkpoint. Pi's firstKeptEntryId / keepRecentTokens may still
@@ -1147,25 +1114,7 @@ summaryMaxTokens: options.summaryMaxTokens,
       liveEfforts.get(sessionId),
     )
 
-    // Remember whether this request actually reused the cache. A continuation
-    // that read nothing means the server dropped the conversation, and then the
-    // next compaction is better left to Pi's small prompt (see
-    // `deferAfterCacheMiss`). Undefined usage counts as "not missed" so a
-    // provider that reports nothing cannot silently disable the extension.
-    const recordCacheOutcome = (usage: AssistantMessage["usage"] | undefined): void => {
-      try {
-        const cacheRead = usage?.cacheRead ?? 0
-        const promptTokens = (usage?.input ?? 0) + cacheRead + (usage?.cacheWrite ?? 0)
-        lastSummaryOutcome.set(sessionId, {
-          at: Date.now(),
-          missed: cacheRead === 0 && promptTokens >= CACHE_MISS_MIN_PROMPT_TOKENS,
-        })
-      } catch {
-        /* observation must never break the request path */
-      }
-    }
-
-    // Fingerprint our summarization request at the exact payload pi-ai sends,
+// Fingerprint our summarization request at the exact payload pi-ai sends,
     // tagged so the debug file can be diffed against the live-request
     // fingerprints from before_provider_request.
     const recordSummaryPayload = (
@@ -1272,18 +1221,9 @@ summaryMaxTokens: options.summaryMaxTokens,
       }
       const durationMs = Date.now() - startedAt
       let rejection = summaryRejection(response)
-      // A reply that stopped cleanly with no text at all is the one rejection
-      // worth retrying: the model spent its turn in the reasoning channel and
-      // never wrote the answer, and since the request is a cache hit the retry
-      // costs seconds. The nudge goes at the *end* of the ask, so the cached
-      // prefix is untouched.
-      // Retry only when it is cheap: a retry on a *miss* would pay a second full
-      // cold prefill, which for a large conversation is minutes (and, at that
-      // point, worse than Pi's small truncated prompt doing the job).
-      const retryAffordable =
-        response.usage.cacheRead > 0 ||
-        response.usage.input + response.usage.cacheRead < CACHE_MISS_MIN_PROMPT_TOKENS
-      if ((rejection === NO_TEXT_REPLY || rejection === TOOL_CALL_TEXT_REPLY) && retryAffordable) {
+// Empty or tool-call-only replies get one deterministic retry. Cache usage is
+// diagnostic only and never changes retry or checkpoint semantics.
+if (rejection === NO_TEXT_REPLY || rejection === TOOL_CALL_TEXT_REPLY) {
         log.both("summary reply was unusable; retrying once", {
           reason: rejection,
           sessionId,
@@ -1327,8 +1267,7 @@ summaryMaxTokens: options.summaryMaxTokens,
         }
       }
       if (rejection) {
-        recordCacheOutcome(response.usage)
-    return preserveFallback("summary rejected", {
+      return preserveFallback("summary rejected", {
       sessionId,
       reason: rejection,
       stopReason: response.stopReason,
@@ -1351,7 +1290,7 @@ summaryMaxTokens: options.summaryMaxTokens,
     ? { cacheCompact: PRESERVE_DIALOGUE_MARKER }
     : undefined),
     }
-    recordCacheOutcome(response.usage)
+// Cache usage remains available in summary_result diagnostics below.
 
     if (options.preserveDialogue === true) {
     const branchEntries = event.branchEntries as SessionEntry[]

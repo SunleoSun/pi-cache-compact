@@ -22,6 +22,8 @@ Summary requests are forward continuations of the live conversation whenever the
 
 After compaction, cache divergence should begin only where newly compacted raw tool/reasoning state was removed. Earlier dialogue and checkpoints must remain stable.
 
+Cache hit/miss outcomes are observability only. Every checkpoint is planned from the current live context as a forward continuation; `cacheRead: 0` never suppresses a later checkpoint, changes summary scope, or delegates compaction semantics to Pi.
+
 ## Token accounting
 
 Preserved tokens are dialogue plus historical checkpoint tokens. Compactable tokens are only new raw state after the latest checkpoint. UI/debug accounting separately reports dialogue, historical checkpoints, raw tool calls/results/reasoning/other, new checkpoint size, provider-reported prompt overhead, estimated system-prompt tokens, estimated tool-declaration tokens, residual provider overhead, context before/after, reclaimed tokens, and compression.
