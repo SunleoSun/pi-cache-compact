@@ -11,14 +11,14 @@ description: Canonical preserve-dialogue semantics, checkpoint lifecycle, and co
 
 Preserve mode keeps these items byte-for-byte/semantically immutable after they enter history:
 - every user message;
-- every visible assistant text block;
+- every completed assistant response (`stopReason: "stop"` with no tool call), preserving its visible text blocks;
 - every active historical Tool Context Checkpoint.
 
-Assistant reasoning, tool-call blocks, and tool-result messages are compactable technical state.
+Assistant reasoning, assistant text from tool-use/interrupted/error/length responses, tool-call blocks, and tool-result messages are compactable technical state.
 
 ## Append-only checkpoints
 
-Each successful preserve compaction appends one hidden `cache-compact-preserve-checkpoint` custom message. Historical checkpoints are never replaced, merged, rewritten, or nulled by later compactions.
+Automatic preserve compaction appends one hidden `cache-compact-preserve-checkpoint` custom message. A real manual `/compact` uses the same preserve summarization semantics immediately (without waiting for reserve pressure) and is persisted by Pi as a preserve-marked immutable compaction checkpoint while earlier active checkpoints remain visible. Preserve mode forces Pi's in-memory `keepRecentTokens` to 1 while automatic compaction is disabled so Pi's manual `prepareCompaction` reaches the extension hook even for short sessions. Historical checkpoints are never replaced, merged, rewritten, or nulled by later compactions.
 
 A new checkpoint covers only raw tool/reasoning state created after the latest active checkpoint. The raw tool state is removed from model context through context edits, while the raw persisted session remains append-only for TUI/history.
 
@@ -33,4 +33,6 @@ A legacy preserve-marked Pi compaction may act as an immutable baseline checkpoi
 Fresh append-only sessions do not require a legacy baseline: custom preserve checkpoints must still be retained in model-visible order from the first checkpoint onward.
 ## Fail closed
 
-If the complete new tool delta cannot be summarized under preserve-mode constraints, cancel/decline the preserve compaction rather than silently leaving raw historical tool traffic or falling back to semantics that rewrite preserved state.
+Transient provider failures while generating a checkpoint use Pi's effective `settings.retry` policy and `pi-ai` retry classifier, matching Pi's own summarization path. Only after that retry budget is exhausted (or for a non-retryable failure) does preserve mode fail closed.
+
+If the complete new tool delta still cannot be summarized under preserve-mode constraints, cancel/decline the preserve compaction rather than silently leaving raw historical tool traffic or falling back to semantics that rewrite preserved state.

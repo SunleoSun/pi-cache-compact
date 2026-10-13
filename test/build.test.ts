@@ -4,8 +4,8 @@ import assert from "node:assert/strict"
 import {
   activeToolDeclarations,
   buildSummaryContext,
-computeFileLists,
-computeFileListsFromMessages,
+  computeFileLists,
+  computeFileListsFromMessages,
   continuationFits,
   extractLiveReasoningEffort,
   extractSummaryText,
@@ -13,9 +13,10 @@ computeFileListsFromMessages,
   isModelAllowed,
   PI_TURN_PREFIX_FORMAT,
   PI_TURN_PREFIX_PROMPT,
-preserveCompactionBudget,
-summaryOutputCap,
-tokenScale,
+  preserveReserveTokens,
+  preserveSummaryOrdinalRejection,
+  summaryOutputCap,
+  tokenScale,
   looksLikeToolCall,
   messageSnippet,
   messagesBeforeEntry,
@@ -31,7 +32,10 @@ test("messagesBeforeEntry returns exactly the messages compaction will drop", ()
   const entries = [
     { sourceEntry: { id: "sys" }, messages: [{ role: "system", content: "SYS" }] },
     { sourceEntry: { id: "u1" }, messages: [{ role: "user", content: "old" }] },
-    { sourceEntry: { id: "a1" }, messages: [{ role: "assistant", content: [{ type: "text", text: "old reply" }] }] },
+    {
+      sourceEntry: { id: "a1" },
+      messages: [{ role: "assistant", content: [{ type: "text", text: "old reply" }] }],
+    },
     { sourceEntry: { id: "keep" }, messages: [{ role: "user", content: "recent kept" }] },
   ]
   const dropped = messagesBeforeEntry(entries, "keep") as any[]
@@ -42,7 +46,10 @@ test("messagesBeforeEntry returns exactly the messages compaction will drop", ()
 })
 
 test("messagesBeforeEntry returns undefined when the kept entry is not in the projection", () => {
-  assert.equal(messagesBeforeEntry([{ sourceEntry: { id: "a" }, messages: [] }], "missing"), undefined)
+  assert.equal(
+    messagesBeforeEntry([{ sourceEntry: { id: "a" }, messages: [] }], "missing"),
+    undefined,
+  )
 })
 
 test("renderSummaryAsk falls back to the default prompt and appends custom instructions", () => {
@@ -55,28 +62,46 @@ test("renderSummaryAsk falls back to the default prompt and appends custom instr
 })
 
 test("renderSummaryAsk has an append-only tool-checkpoint mode scoped by user message", () => {
-const first = renderSummaryAsk({ preserveDialogue: true })
-assert.match(first, /NEW compact incremental technical checkpoint/i)
-assert.match(first, /Historical Tool Context Checkpoints are immutable preserved context/)
-assert.match(first, /Do NOT repeat, merge, rewrite, update, summarize, or supersede them/)
-assert.match(first, /most recent preceding user message/)
-assert.match(first, /User message N/)
-assert.match(first, /Summarize RESULTS/i)
-assert.match(first, /Do NOT summarize, paraphrase, restate, reinterpret, or quote them/)
-assert.match(first, /thinking\/reasoning is intentionally discarded/i)
-assert.doesNotMatch(first, /^## Goal$/m)
+  const first = renderSummaryAsk({ preserveDialogue: true })
+  assert.match(first, /NEW compact incremental technical checkpoint/i)
+  assert.match(first, /Historical Tool Context Checkpoints are immutable preserved context/)
+  assert.match(first, /Do NOT repeat, merge, rewrite, update, summarize, or supersede them/)
+  assert.match(first, /most recent preceding user message/)
+  assert.match(first, /User message N/)
+  assert.match(first, /Summarize RESULTS/i)
+  assert.match(first, /Do NOT summarize, paraphrase, restate, reinterpret, or quote them/)
+  assert.match(first, /synthetic cache-compact control text/i)
+  assert.match(first, /thinking\/reasoning is intentionally discarded/i)
+  assert.doesNotMatch(first, /^## Goal$/m)
 
-const withHistory = renderSummaryAsk({ preserveDialogue: true, previous: true })
-assert.equal(withHistory, first, "a historical checkpoint must not switch preserve mode into rewrite/update semantics")
-assert.doesNotMatch(withHistory, /Update the existing technical tool-context checkpoint/)
+  const withHistory = renderSummaryAsk({ preserveDialogue: true, previous: true })
+  assert.equal(
+    withHistory,
+    first,
+    "a historical checkpoint must not switch preserve mode into rewrite/update semantics",
+  )
+  assert.doesNotMatch(withHistory, /Update the existing technical tool-context checkpoint/)
 
-const explicitOrdinals = renderSummaryAsk({
-preserveDialogue: true,
-preserveUserMessageOrdinals: [5, 6],
+  const explicitOrdinals = renderSummaryAsk({
+    preserveDialogue: true,
+    preserveUserMessageOrdinals: [5, 6],
+  })
+  assert.match(explicitOrdinals, /absolute user-message ordinal\(s\): 5, 6/)
+  assert.match(explicitOrdinals, /Use ONLY these exact ordinals/)
+  assert.match(explicitOrdinals, /outside the new delta/)
 })
-assert.match(explicitOrdinals, /absolute user-message ordinal\(s\): 5, 6/)
-assert.match(explicitOrdinals, /Use these exact ordinals/)
-assert.match(explicitOrdinals, /outside the new delta/)
+
+test("preserveSummaryOrdinalRejection rejects only user-message headings outside the requested ordinals", () => {
+  const good = "## Tool Context\n\n### User message 1\n#### Findings\n- a\n\n### User message 2\n#### Findings\n- b"
+  assert.equal(preserveSummaryOrdinalRejection(good, [1, 2]), undefined)
+  assert.match(
+    preserveSummaryOrdinalRejection(`${good}\n\n### User message 3\n#### Findings\n- synthetic`, [1, 2])!,
+    /invented user-message heading\(s\): 3/,
+  )
+  assert.equal(
+    preserveSummaryOrdinalRejection("## Tool Context\n\n### User message 1\n#### Findings\n- a", [1, 2]),
+    undefined,
+  )
 })
 
 test("activeToolDeclarations keeps only active tools, in Pi's order", () => {
@@ -134,13 +159,13 @@ test("summaryRejection rejects empty, truncated, aborted, errored, and tool-call
     /no summary text/,
   )
   assert.match(
-    summaryRejection({ stopReason: "length", content: [{ type: "text", text: "partial" }] as any })!,
+    summaryRejection({
+      stopReason: "length",
+      content: [{ type: "text", text: "partial" }] as any,
+    })!,
     /token cap/,
   )
-  assert.match(
-    summaryRejection({ stopReason: "aborted", content: [] as any })!,
-    /aborted/,
-  )
+  assert.match(summaryRejection({ stopReason: "aborted", content: [] as any })!, /aborted/)
   assert.match(
     summaryRejection({ stopReason: "error", content: [], errorMessage: "boom" } as any)!,
     /boom/,
@@ -202,10 +227,9 @@ test("replayableHeaders keeps custom headers and drops transport-managed ones", 
 })
 
 test("replayableHeaders drops null deletions and returns undefined when nothing remains", () => {
-  assert.deepEqual(
-    replayableHeaders({ "x-removed": null, "content-length": "1", "x-kept": "v" }),
-    { "x-kept": "v" },
-  )
+  assert.deepEqual(replayableHeaders({ "x-removed": null, "content-length": "1", "x-kept": "v" }), {
+    "x-kept": "v",
+  })
   assert.equal(replayableHeaders(undefined), undefined)
   assert.equal(replayableHeaders({}), undefined)
   assert.equal(replayableHeaders({ connection: "keep-alive" }), undefined)
@@ -216,7 +240,9 @@ test("renderSummaryAsk appends a boundary note only when given one", () => {
   assert.match(plain, /context checkpoint summary/i)
   assert.doesNotMatch(plain, /stay in the context verbatim/)
 
-  const scoped = renderSummaryAsk({ boundary: { keptCount: 2, role: "assistant", snippet: "hi there" } })
+  const scoped = renderSummaryAsk({
+    boundary: { keptCount: 2, role: "assistant", snippet: "hi there" },
+  })
   assert.ok(scoped.startsWith(plain))
   assert.match(scoped, /2 later message\(s\) stay in the context verbatim/)
   assert.match(scoped, /up to and including the assistant message that begins/)
@@ -224,13 +250,25 @@ test("renderSummaryAsk appends a boundary note only when given one", () => {
 
   // Focus text and the boundary coexist; the boundary stays last so it is the
   // most recently read instruction.
-  const both = renderSummaryAsk({ focus: "focus on tests", boundary: { keptCount: 1, role: "user", snippet: "x" } })
-  assert.ok(both.indexOf("Additional focus: focus on tests") < both.indexOf("stay in the context verbatim"))
+  const both = renderSummaryAsk({
+    focus: "focus on tests",
+    boundary: { keptCount: 1, role: "user", snippet: "x" },
+  })
+  assert.ok(
+    both.indexOf("Additional focus: focus on tests") < both.indexOf("stay in the context verbatim"),
+  )
 })
 
 test("messageSnippet collapses whitespace, reads text blocks, and truncates", () => {
   assert.equal(messageSnippet("  hello\n\n  world "), "hello world")
-  assert.equal(messageSnippet([{ type: "text", text: "a" }, { type: "thinking", text: "b" }, { type: "text", text: "c" }]), "a c")
+  assert.equal(
+    messageSnippet([
+      { type: "text", text: "a" },
+      { type: "thinking", text: "b" },
+      { type: "text", text: "c" },
+    ]),
+    "a c",
+  )
   assert.equal(messageSnippet([{ type: "toolCall", name: "read" }]), "")
   assert.equal(messageSnippet(undefined), "")
   const long = "z".repeat(500)
@@ -240,31 +278,56 @@ test("messageSnippet collapses whitespace, reads text blocks, and truncates", ()
 })
 
 test("promptTokensOf sums the server-reported prompt, assistant messages only", () => {
-  assert.equal(promptTokensOf({ role: "assistant", usage: { input: 16, cacheRead: 109915, cacheWrite: 0 } }), 109931)
+  assert.equal(
+    promptTokensOf({ role: "assistant", usage: { input: 16, cacheRead: 109915, cacheWrite: 0 } }),
+    109931,
+  )
   assert.equal(promptTokensOf({ role: "toolResult", usage: { input: 5 } }), undefined)
   assert.equal(promptTokensOf({ role: "assistant" }), undefined)
   assert.equal(promptTokensOf("nope"), undefined)
   // A zeroed usage record is not a usable report — reading it as 0 would let an
   // oversized continuation through the guard.
-  assert.equal(promptTokensOf({ role: "assistant", usage: { input: 0, cacheRead: 0, cacheWrite: 0 } }), undefined)
+  assert.equal(
+    promptTokensOf({ role: "assistant", usage: { input: 0, cacheRead: 0, cacheWrite: 0 } }),
+    undefined,
+  )
 })
 
 test("continuationFits uses reported usage for the bulk and estimates the delta", () => {
   const messages = [
     { role: "system", content: "S".repeat(400) },
     { role: "user", content: "u" },
-    { role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 10, cacheRead: 90_000, cacheWrite: 0 } },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      usage: { input: 10, cacheRead: 90_000, cacheWrite: 0 },
+    },
   ]
   // 90_010 reported + a tiny delta, comfortably inside 131k minus 8k.
-  assert.equal(continuationFits({ contextWindow: 131_072, maxTokens: 8192, messages, ask: "summarize" }), true)
+  assert.equal(
+    continuationFits({ contextWindow: 131_072, maxTokens: 8192, messages, ask: "summarize" }),
+    true,
+  )
   // Same request against a window it cannot fit.
-  assert.equal(continuationFits({ contextWindow: 40_000, maxTokens: 8192, messages, ask: "summarize" }), false)
+  assert.equal(
+    continuationFits({ contextWindow: 40_000, maxTokens: 8192, messages, ask: "summarize" }),
+    false,
+  )
   // Unknown window: allowed rather than disabling the cache-friendly shape.
-  assert.equal(continuationFits({ contextWindow: undefined, maxTokens: 8192, messages, ask: "x" }), true)
+  assert.equal(
+    continuationFits({ contextWindow: undefined, maxTokens: 8192, messages, ask: "x" }),
+    true,
+  )
   // No usage anywhere: the whole request is estimated from bytes.
   const noUsage = [{ role: "user", content: "x".repeat(3000) }]
-  assert.equal(continuationFits({ contextWindow: 131_072, maxTokens: 8192, messages: noUsage, ask: "x" }), true)
-  assert.equal(continuationFits({ contextWindow: 1000, maxTokens: 100, messages: noUsage, ask: "x" }), false)
+  assert.equal(
+    continuationFits({ contextWindow: 131_072, maxTokens: 8192, messages: noUsage, ask: "x" }),
+    true,
+  )
+  assert.equal(
+    continuationFits({ contextWindow: 1000, maxTokens: 100, messages: noUsage, ask: "x" }),
+    false,
+  )
 })
 
 test("planSummaryRequest picks the continuation and names the boundary", () => {
@@ -286,7 +349,11 @@ test("planSummaryRequest picks the continuation and names the boundary", () => {
   assert.equal(plan.shape, "continuation")
   assert.equal(plan.messages, liveMessages)
   assert.equal(plan.droppedMessages, droppedMessages)
-  assert.deepEqual(plan.boundary, { keptCount: 1, role: "assistant", snippet: "done, and here is why" })
+  assert.deepEqual(plan.boundary, {
+    keptCount: 1,
+    role: "assistant",
+    snippet: "done, and here is why",
+  })
   assert.match(plan.ask, /stay in the context verbatim/)
 
   // continuation: false is the old request shape, and needs no boundary note.
@@ -302,7 +369,6 @@ test("planSummaryRequest picks the continuation and names the boundary", () => {
   assert.equal(rewound.messages, droppedMessages)
   assert.equal(rewound.boundary, undefined)
   assert.doesNotMatch(rewound.ask, /stay in the context verbatim/)
-
 
   // A continuation that cannot fit falls back to the dropped span — but only
   // when the smaller shape is the one that fits.
@@ -361,29 +427,103 @@ test("planSummaryRequest does not use a cached request that stops before a resto
   })
 
   assert.notEqual(plan.shape, "continuation-request")
-  })
+})
 
-  test("planSummaryRequest bounds preserve summary output by actually reclaimed state", () => {
+test("preserve summary output is bounded by reserve/model, not reclaimed-state size", () => {
   const preservedDialogue = { role: "user", content: "x".repeat(200_000) } as any
-  const compactableToolState = { role: "toolResult", content: [{ type: "text", text: "y".repeat(20_000) }] } as any
+  const compactableToolState = {
+    role: "toolResult",
+    content: [{ type: "text", text: "y".repeat(20_000) }],
+  } as any
   const liveMessages = [preservedDialogue, compactableToolState]
 
   const plan = planSummaryRequest({
-  liveMessages,
-  requestMessages: liveMessages,
-  droppedMessages: liveMessages,
-  keptCount: 0,
-  options: { preserveDialogue: true },
-  contextWindow: 300_000,
-  reserveTokens: 16_384,
-  modelMaxTokens: 32_000,
-  reclaimedTokens: 5_000,
+    liveMessages,
+    requestMessages: liveMessages,
+    droppedMessages: liveMessages,
+    keptCount: 0,
+    options: { preserveDialogue: true },
+    contextWindow: 300_000,
+    reserveTokens: 70_000,
+    modelMaxTokens: 32_000,
+    // reserve-only policy
   })
 
-  assert.equal(plan.maxTokens, 2_500)
-  })
+  assert.equal(plan.maxTokens, 32_000)
+})
 
-  test("planSummaryRequest continues the last live request when the projection is too big", () => {
+test("preserve plan uses reserveTokens as output ceiling and clips only to actual fit", () => {
+  const liveMessages: any[] = [
+    { role: "user", content: "x".repeat(110_000) },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      usage: { input: 36_954, cacheRead: 0, cacheWrite: 0 },
+    },
+  ]
+
+  const plan = planSummaryRequest({
+    liveMessages,
+    requestMessages: liveMessages,
+    droppedMessages: liveMessages,
+    keptCount: 0,
+    options: { preserveDialogue: true },
+    contextWindow: 50_000,
+    reserveTokens: preserveReserveTokens(50_000),
+    modelMaxTokens: 32_000,
+    // reserve-only policy
+  })
+  assert.equal(plan.shape, "continuation")
+  assert.equal(plan.requestFits, true)
+  assert.equal(plan.maxTokens, preserveReserveTokens(50_000))
+
+  const tooLate = planSummaryRequest({
+    liveMessages,
+    requestMessages: liveMessages,
+    droppedMessages: liveMessages,
+    keptCount: 0,
+    options: { preserveDialogue: true },
+    contextWindow: 38_500,
+    reserveTokens: preserveReserveTokens(38_500),
+    modelMaxTokens: 32_000,
+    // reserve-only policy
+  })
+  assert.equal(tooLate.requestFits, true)
+  assert.ok(tooLate.maxTokens > 0)
+  assert.ok(tooLate.maxTokens < preserveReserveTokens(38_500))
+})
+
+test("preserve planning trusts the exact previous provider-prefix token count", () => {
+  const prefix = [
+    { role: "system", content: "SYSTEM" },
+    { role: "user", content: "x".repeat(80_000) },
+  ] as any[]
+  const latestBatch = [
+    {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "latest", name: "read", arguments: {} }],
+    },
+    { role: "toolResult", content: [{ type: "text", text: "LATEST RAW".repeat(1000) }] },
+  ] as any[]
+  const plan = planSummaryRequest({
+    liveMessages: [...prefix, ...latestBatch],
+    requestMessages: prefix,
+    requestPromptTokens: 41_000,
+    droppedMessages: prefix,
+    keptCount: latestBatch.length,
+    options: { preserveDialogue: true },
+    contextWindow: 50_000,
+    reserveTokens: preserveReserveTokens(50_000),
+    modelMaxTokens: 32_000,
+  })
+  assert.equal(plan.shape, "continuation-request")
+  assert.equal(plan.requestFits, true)
+  assert.ok(plan.maxTokens > 0)
+  assert.ok(plan.maxTokens < preserveReserveTokens(50_000))
+  assert.deepEqual(plan.messages, prefix)
+})
+
+test("planSummaryRequest continues the last live request when the projection is too big", () => {
   // The production case: a 100 KB tool result arrives after the last request, so
   // the whole projection no longer fits the window — but the request the server
   // has cached still does, and appending the ask to *it* is still a forward
@@ -391,10 +531,20 @@ test("planSummaryRequest does not use a cached request that stops before a resto
   const droppedMessages: any[] = [
     { role: "system", content: "SYS" },
     { role: "user", content: "do the thing" },
-    { role: "assistant", content: [{ type: "text", text: "working" }], usage: { input: 1000, cacheRead: 40_000 } },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "working" }],
+      usage: { input: 1000, cacheRead: 40_000 },
+    },
   ]
-  const requestMessages: any[] = [...droppedMessages, { role: "toolResult", content: "small output" }]
-  const liveMessages: any[] = [...requestMessages, { role: "toolResult", content: "x".repeat(200_000) }]
+  const requestMessages: any[] = [
+    ...droppedMessages,
+    { role: "toolResult", content: "small output" },
+  ]
+  const liveMessages: any[] = [
+    ...requestMessages,
+    { role: "toolResult", content: "x".repeat(200_000) },
+  ]
 
   const plan = planSummaryRequest({
     liveMessages,
@@ -416,10 +566,17 @@ test("planSummaryRequest does not use a cached request that stops before a resto
 test("planSummaryRequest continues the whole projection when it fits", () => {
   const droppedMessages: any[] = [
     { role: "system", content: "SYS" },
-    { role: "assistant", content: [{ type: "text", text: "done" }], usage: { input: 1000, cacheRead: 40_000 } },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      usage: { input: 1000, cacheRead: 40_000 },
+    },
   ]
   const requestMessages: any[] = [...droppedMessages, { role: "user", content: "small" }]
-  const liveMessages: any[] = [...requestMessages, { role: "assistant", content: [{ type: "text", text: "reply" }] }]
+  const liveMessages: any[] = [
+    ...requestMessages,
+    { role: "assistant", content: [{ type: "text", text: "reply" }] },
+  ]
   const plan = planSummaryRequest({
     liveMessages,
     requestMessages,
@@ -435,7 +592,10 @@ test("planSummaryRequest continues the whole projection when it fits", () => {
 })
 
 test("planSummaryRequest falls back when the projection is already the dropped span", () => {
-  const messages: any[] = [{ role: "system", content: "SYS" }, { role: "user", content: "hi" }]
+  const messages: any[] = [
+    { role: "system", content: "SYS" },
+    { role: "user", content: "hi" },
+  ]
   const plan = planSummaryRequest({
     liveMessages: messages,
     requestMessages: messages,
@@ -450,7 +610,7 @@ test("planSummaryRequest falls back when the projection is already the dropped s
   assert.equal(plan.messages, messages)
 })
 
-test("resolveSummaryReasoningEffort passes \"none\" through and omits for \"off\"", () => {
+test('resolveSummaryReasoningEffort passes "none" through and omits for "off"', () => {
   // llama.cpp documents `reasoning_effort: "none"` as disabling reasoning, and
   // unlike the other levels it is not given to the chat template — which is why
   // it is the cache-safe way to stop a thinking-only reply.
@@ -458,7 +618,7 @@ test("resolveSummaryReasoningEffort passes \"none\" through and omits for \"off\
   assert.equal(resolveSummaryReasoningEffort("off", "medium"), undefined)
 })
 
-test("resolveSummaryReasoningEffort treats \"off\" as omitting the field", () => {
+test('resolveSummaryReasoningEffort treats "off" as omitting the field', () => {
   // The mirror is the default; "off" must beat it and produce no field at all.
   assert.equal(resolveSummaryReasoningEffort(undefined, "medium"), "medium")
   assert.equal(resolveSummaryReasoningEffort("off", "medium"), undefined)
@@ -485,7 +645,10 @@ test("the default ask gives an explicit skeleton and a starting point", () => {
 test("renderSummaryAsk mirrors Pi's split-turn artifact", () => {
   const ask = renderSummaryAsk({
     boundary: { keptCount: 5, role: "assistant", snippet: "start of history end" },
-    split: { boundary: { keptCount: 5, role: "toolResult", snippet: "tail of the turn" }, hasHistory: true },
+    split: {
+      boundary: { keptCount: 5, role: "toolResult", snippet: "tail of the turn" },
+      hasHistory: true,
+    },
   })
   // Pi writes `${history}\n\n---\n\n**Turn Context (split turn):**\n\n${prefix}`.
   assert.match(ask, /\*\*Turn Context \(split turn\):\*\*/)
@@ -572,82 +735,88 @@ test("summaryRejection refuses tool-call syntax written as text", () => {
   // become the conversation prefix.
   const asText = {
     stopReason: "stop",
-    content: [{ type: "text", text: '<tool_call>\n<function=bash>\n<parameter=command>ls\n</tool_call>' }],
+    content: [
+      { type: "text", text: "<tool_call>\n<function=bash>\n<parameter=command>ls\n</tool_call>" },
+    ],
   } as any
   assert.match(summaryRejection(asText) ?? "", /tool call instead of a summary/)
-  assert.equal(looksLikeToolCall('<tool_call><function=bash>'), true)
+  assert.equal(looksLikeToolCall("<tool_call><function=bash>"), true)
   assert.equal(looksLikeToolCall("<|tool_call|>"), true)
   assert.equal(looksLikeToolCall("[tool_call]"), true)
   // A real summary that merely mentions tools is fine.
   assert.equal(
-    summaryRejection({ stopReason: "stop", content: [{ type: "text", text: "## Goal\nFix the tool call handling in `bash`." }] } as any),
+    summaryRejection({
+      stopReason: "stop",
+      content: [{ type: "text", text: "## Goal\nFix the tool call handling in `bash`." }],
+    } as any),
     undefined,
   )
   assert.equal(looksLikeToolCall("## Goal\nFix the tool call handling."), false)
 })
 
-test("preserveCompactionBudget triggers at 90% of space left after preserved dialogue", () => {
-const below = preserveCompactionBudget({
-contextTokens: 262_999,
-contextWindow: 300_000,
-preservedTokens: 20_000,
-headroomTokens: 10_000,
+test("reserveTokens is the only preserve compaction threshold", () => {
+  const reserve = preserveReserveTokens(250_000)
+  assert.equal(reserve, 21_127)
+  assert.equal(250_000 - reserve, 228_873)
 })
-assert.equal(below.availableTokens, 270_000)
-assert.equal(below.thresholdTokens, 243_000)
-assert.equal(below.occupiedTokens, 242_999)
-assert.equal(below.shouldCompact, false)
 
-const atThreshold = preserveCompactionBudget({
-contextTokens: 263_000,
-contextWindow: 300_000,
-preservedTokens: 20_000,
-headroomTokens: 10_000,
-})
-assert.equal(atThreshold.occupiedTokens, 243_000)
-assert.equal(atThreshold.shouldCompact, true)
-
-const dialogueHeavy = preserveCompactionBudget({
-contextTokens: 284_000,
-contextWindow: 300_000,
-preservedTokens: 230_000,
-headroomTokens: 10_000,
-})
-assert.equal(dialogueHeavy.availableTokens, 60_000)
-assert.equal(dialogueHeavy.thresholdTokens, 54_000)
-assert.equal(dialogueHeavy.shouldCompact, true)
+test("certification: fitted preserve reserve scales smoothly with model context", () => {
+  assert.equal(preserveReserveTokens(25_000), 6_160)
+  assert.equal(preserveReserveTokens(50_000), 8_886)
+  assert.equal(preserveReserveTokens(100_000), 12_974)
+  assert.equal(preserveReserveTokens(128_000), 14_838)
+  assert.equal(preserveReserveTokens(200_000), 18_823)
+  assert.equal(preserveReserveTokens(250_000), 21_127)
+  assert.equal(preserveReserveTokens(300_000), 23_164)
+  assert.equal(preserveReserveTokens(500_000), 29_575)
+  assert.equal(preserveReserveTokens(1_000_000), 39_593)
+  assert.equal(preserveReserveTokens(undefined), 16_384)
 })
 
 test("computeFileListsFromMessages includes all tool calls and merges prior checkpoint state", () => {
-const result = computeFileListsFromMessages(
-[
-{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "kept-tail.ts" } }] },
-{ role: "assistant", content: [{ type: "toolCall", name: "write", arguments: { path: "old-read.ts" } }] },
-{ role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "edited.ts" } }] },
-{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "edited.ts" } }] },
-],
-{ readFiles: ["old-read.ts", "prior-read.ts"], modifiedFiles: ["prior-modified.ts"] },
-)
-assert.deepEqual(result.readFiles, ["kept-tail.ts", "prior-read.ts"])
-assert.deepEqual(result.modifiedFiles, ["edited.ts", "old-read.ts", "prior-modified.ts"])
+  const result = computeFileListsFromMessages(
+    [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", name: "read", arguments: { path: "kept-tail.ts" } }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", name: "write", arguments: { path: "old-read.ts" } }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", name: "edit", arguments: { path: "edited.ts" } }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", name: "read", arguments: { path: "edited.ts" } }],
+      },
+    ],
+    { readFiles: ["old-read.ts", "prior-read.ts"], modifiedFiles: ["prior-modified.ts"] },
+  )
+  assert.deepEqual(result.readFiles, ["kept-tail.ts", "prior-read.ts"])
+  assert.deepEqual(result.modifiedFiles, ["edited.ts", "old-read.ts", "prior-modified.ts"])
 })
 
-test("summaryOutputCap derives Pi's ceiling, bounded by what is reclaimed", () => {
-  // Pi's rule with default settings: 0.8 x 16,384.
-  assert.equal(summaryOutputCap({}), 13_107)
-  assert.equal(summaryOutputCap({ reserveTokens: 8192 }), 6553)
-  // ...clamped by the model's own output limit.
-  assert.equal(summaryOutputCap({ modelMaxTokens: 4096 }), 4096)
-  // ...and bounded by half of what the compaction drops, so a checkpoint can
-  // never be larger than what it replaces (Pi's split-turn concatenation can
-  // reach 1.3x its reserve; this cannot).
-  assert.equal(summaryOutputCap({ droppedTokens: 200_000 }), 13_107) // generous case: Pi's cap
-  assert.equal(summaryOutputCap({ droppedTokens: 8000 }), 4000) // small drop: tighter
-  assert.equal(summaryOutputCap({ droppedTokens: 100 }), 2048) // floor for thinking tokens
-  // An explicit config value skips all of it.
-  assert.equal(summaryOutputCap({ configured: 333, droppedTokens: 100 }), 333)
-  // No reserve information at all: still Pi's shape of answer, not a crash.
-  assert.equal(summaryOutputCap({ reserveTokens: undefined, modelMaxTokens: undefined }), 13_107)
+test("certification: preserve summary output uses reserveTokens and actual fit", () => {
+  assert.equal(summaryOutputCap({ reserveTokens: 10_000, preserveDialogue: true }), 10_000)
+  assert.equal(summaryOutputCap({ reserveTokens: 20_000, preserveDialogue: true }), 20_000)
+  assert.equal(summaryOutputCap({ reserveTokens: 35_000, preserveDialogue: true }), 35_000)
+  assert.equal(summaryOutputCap({ reserveTokens: 70_000, preserveDialogue: true }), 70_000)
+  assert.equal(
+    summaryOutputCap({ reserveTokens: 70_000, modelMaxTokens: 4096, preserveDialogue: true }),
+    4096,
+  )
+  assert.equal(
+    summaryOutputCap({
+      reserveTokens: undefined,
+      modelMaxTokens: undefined,
+      preserveDialogue: true,
+    }),
+    16_384,
+  )
+  assert.equal(summaryOutputCap({ reserveTokens: 16_384, preserveDialogue: false }), 13_107)
 })
 
 test("tokenScale calibrates byte estimates against the server's own count", () => {
@@ -656,16 +825,27 @@ test("tokenScale calibrates byte estimates against the server's own count", () =
   const blob = "x".repeat(30_000)
   const calibrated = [
     { role: "user", content: blob },
-    { role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 100, cacheRead: 0, cacheWrite: 0 } },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      usage: { input: 100, cacheRead: 0, cacheWrite: 0 },
+    },
   ]
   const scale = tokenScale(calibrated as any)
-  assert.ok(scale < 0.2 + 1e-9 || scale === 0.2, `expected a strongly correcting scale, got ${scale}`)
+  assert.ok(
+    scale < 0.2 + 1e-9 || scale === 0.2,
+    `expected a strongly correcting scale, got ${scale}`,
+  )
 
   // Agreement between the two means no meaningful correction (the estimate is
   // only accurate to its own JSON overhead, hence the tolerance).
   const agreeing = [
     { role: "user", content: "y".repeat(3000) },
-    { role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 1000, cacheRead: 0, cacheWrite: 0 } },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      usage: { input: 1000, cacheRead: 0, cacheWrite: 0 },
+    },
   ]
   assert.ok(Math.abs(tokenScale(agreeing as any) - 1) < 0.05)
 
@@ -678,7 +858,11 @@ test("calibration changes what fits", () => {
   // and it is the part a bad ratio distorts. The reported prompt covers
   // everything before it exactly, so only that tail is in question.
   const messages: any[] = [
-    { role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 6000, cacheRead: 0, cacheWrite: 0 } },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      usage: { input: 6000, cacheRead: 0, cacheWrite: 0 },
+    },
     { role: "user", content: "y".repeat(60_000) },
   ]
   const args = { contextWindow: 30_000, maxTokens: 4096, messages, ask: "summarize" }

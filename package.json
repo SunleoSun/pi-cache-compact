@@ -1,7 +1,7 @@
 {
   "name": "pi-cache-compact-preserved-messages",
-"version": "1.1.4",
-  "description": "Cache-friendly Pi compaction that preserves historical user messages and visible assistant responses verbatim.",
+"version": "1.2.1",
+  "description": "Cache-friendly Pi compaction that preserves historical user messages and completed assistant responses verbatim.",
   "type": "module",
   "license": "MIT",
   "main": "src/extension.ts",

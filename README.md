@@ -25,12 +25,12 @@ List managed packages with `pi list`.
 `preserveDialogue` defaults to `true`. The permanent model context consists of:
 
 - every historical **user message**, verbatim;
-- every visible **assistant text** block, verbatim;
+- every completed **assistant response** (`stopReason: "stop"` and no tool call), preserving its visible text verbatim;
 - every historical **Tool Context Checkpoint**, immutable after creation.
 
-Assistant reasoning, tool calls and tool results are compactable technical state.
+Assistant reasoning, assistant text from tool-use/interrupted/error/length responses, tool calls and tool results are compactable technical state.
 
-Preserve mode checkpoints at a tool-bearing `turn_end`, at the earlier of its dynamic 90% pressure limit or Pi's effective native threshold. It does not append a Pi `compaction` entry, so the raw/TUI transcript is not cleared. Instead it adds context edits that hide compacted tool/reasoning state from future model requests and appends one hidden checkpoint.
+Preserve mode checkpoints at a tool-bearing `turn_end`. `reserveTokens` is the only preserve-mode threshold policy and is derived from the smooth fitted curve `round(88319.65 + (1468.926 - 88319.65) / (1 + (contextWindow / 1413076)^0.7096055))`. Because `turn_end` runs after the tool batch is in Pi's projection, a checkpoint starts when Pi's current context usage reaches `contextWindow - reserveTokens`; the batch estimate is used for raw-tail accounting, not added to the already-current context a second time. The newest completed assistant/tool batch is deliberately excluded from the summary and remains raw after the new checkpoint; only older raw tool/reasoning state is compacted. Summary output may use up to `reserveTokens`, clipped by the summarizer model and the request's actual remaining fit. Pi-native compaction is disabled in memory and native threshold/overflow/manual compaction is cancelled in preserve mode. The reserve is refreshed at session start, model selection, and user input, with a model-aware fallback if needed.
 
 ### Append-only checkpoints
 
@@ -77,23 +77,25 @@ The summary request is normally a strict forward continuation of the live conver
 
 After compaction, divergence should start only where newly compacted raw tool/reasoning state disappeared. User/assistant dialogue and older checkpoints stay stable.
 
-If the full new tool delta cannot be summarized without violating preserve semantics, preserve mode fails closed rather than silently delegating to a lossy fallback.
+When the newest tool batch crosses the reserve boundary, the summary request continues from the previous provider prefix, before that batch. The batch is then placed raw after the new checkpoint, so it is never sacrificed merely to make the summary fit. The checkpoint's projected model message retains its append timestamp so Pi's context estimator invalidates stale assistant usage from the larger pre-checkpoint prompt before sizing the first post-checkpoint response. If no older compactable state exists, preserve mode does not manufacture a checkpoint; if the newest batch itself fills the physical model window, continuation is stopped rather than delegating to Pi-native compaction.
 
 ## Compaction UI
 
 A successful preserve checkpoint reports the trigger and token accounting, for example:
 
 ```text
-[cache-compact] compact complete: normal (dynamic 90%)
+[cache-compact] compact complete: reserve threshold
 context before: 35562 tok
-context after: ~8590 tok
-reclaimed: ~26972 tok
+context after: ~...
+reclaimed: ~...
 
 preserved dialogue: 2080 tok
- user messages: ~1220 tok
- assistant text: ~860 tok
+  user messages: ~1220 tok
+  assistant text: ~860 tok
 historical checkpoints: 310 tok (1)
-new raw compactable: 27192 tok
+raw technical before: 27192 tok
+  older raw compacted: ~22000 tok
+  newest raw kept: ~5192 tok
   tool calls: ~...
   tool results: ~...
   reasoning: ~...
@@ -133,7 +135,6 @@ Example:
 | `summaryModel` | Optional `{ provider, id }` summarizer; falls back to active model. |
 | `summaryPrompt` | Replace the default summary instruction. |
 | `preserveDialogue` | Preserve dialogue + append-only technical checkpoints. Default `true`. |
-| `summaryMaxTokens` | Explicit summary-output ceiling; otherwise derived from Pi/model/reclaimed state. |
 | `summaryReasoningEffort` | Explicit summary effort. Omitted mirrors the last live request. |
 | `cacheRetention` | Provider cache retention: `none`, `short`, `long`; default `short`. |
 | `toolChoice` | Summary request tool choice: `none` or `auto`; default `none`. Tool declarations remain for prefix identity. |
@@ -141,7 +142,11 @@ Example:
 | `rewindWhenNeeded` | Permit dropped-span rewind when no continuation fits. Default `false`. |
 | `debug` | Master debug switch. `false` (default) disables stderr/structured debug output and never creates/touches `debugFile`. |
 | `debugFile` | Absolute JSONL path for structured diagnostics. The file is written only when `debug: true`. |
-| `debugPayloads` | Legacy optional full payload dumps around compaction for `compare-dumps.mjs`. |
+| `debugPayloads` | Optional compact payload dumps around compaction for `compare-dumps.mjs`; conversation messages are retained, but provider tool declarations are stored as names only. |
+
+Summary provider failures use Pi's effective `settings.retry` policy before compaction is rejected. That means cache-compact uses the same transient-error classifier and the same `retry.enabled`, `retry.maxRetries`, `retry.baseDelayMs`, and `retry.maxAgentDelayMs` values as Pi's own compaction/branch-summary path; there is no separate retry configuration in this extension.
+
+`/compact` also uses the preserve-dialogue compactor when preserve mode is enabled. Manual compaction does not wait for the reserve threshold: it checkpoints all currently uncheckpointed technical state while preserving user messages and completed assistant answers. While preserve mode is active the extension keeps Pi's automatic compaction disabled and sets Pi's in-memory `keepRecentTokens` to 1, solely so manual preparation cannot reject a short session before the extension hook runs.
 
 ## Debugging and observability
 
@@ -154,11 +159,12 @@ The canonical records are:
 - `preserve_compaction` — one self-contained audit record per successful preserve checkpoint. It contains checkpoint number/scope, absolute covered user-message ordinals, raw branch entry IDs/boundaries, historical checkpoint IDs/hashes, the provider tool declarations captured before compaction, full predicted model-visible `contextBefore` and `contextAfter`, a per-message index (`role`, semantic kind, source session-entry ID, checkpoint number, estimated tokens, hash), complete token accounting, compression/reclaimed estimates, and a structural stable-prefix diagnostic including the first divergence.
 - `post_compaction_context` — the **actual next provider** messages/tool declarations after the checkpoint, plus an exact provider-message shared-prefix count against the previous live request and hashes of the checkpoints present in the branch.
 - `provider_request`, `provider_headers`, `provider_response` — request/cache fingerprints and redacted transport diagnostics.
-- `summary_start`, `summary_result`, `summary_retry` — summary lifecycle.
+- `summary_start`, `summary_result`, `summary_retry` — summary lifecycle and the deterministic retry for unusable non-error summary output.
+- `summary_provider_retry_scheduled`, `summary_provider_retry_attempt_start`, `summary_provider_retry_finished` — transient provider retry lifecycle driven by Pi's `settings.retry`.
 
 The debug context contains conversation text and tool-derived state. Treat it as private and do not commit/share it casually.
 
-`debugPayloads: true` still emits legacy `payload_dump` records (`live_before`, `summarization`, `live_after`) for `scripts/compare-dumps.mjs`, but the canonical compaction audit no longer depends on that option.
+`debugPayloads: true` still emits `payload_dump` records (`live_before`, `summarization`, `live_after`) for `scripts/compare-dumps.mjs`, but provider tool schemas are replaced by tool names before anything is written. `provider_request` keeps the tool count, names, and a short hash of the full declaration set, so schema changes remain detectable without bloating the log. The canonical compaction audit no longer depends on `debugPayloads`.
 
 ## Token accounting
 
@@ -168,9 +174,9 @@ Preserve-mode accounting separates:
 - estimated non-system context before, system prompt, tool declarations, and residual provider overhead;
 - preserved dialogue, with separate user-message and visible-assistant-text estimates;
 - historical checkpoint tokens + count;
-- new raw compactable tool calls/results/reasoning/other;
-- new checkpoint size and explicit `remainingRawCompactable: 0` on successful preserve compaction;
-- estimated context after, reclaimed tokens and compression.
+- total raw technical state before checkpointing, including tool calls/results/reasoning/other;
+- the older raw portion actually compacted and the newest raw tail intentionally kept;
+- new checkpoint size, remaining raw technical state, estimated context after, reclaimed tokens and compression.
 
 Historical checkpoints are preserved tokens; they are never counted as raw state to compact again.
 

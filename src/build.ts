@@ -93,7 +93,6 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`
 
-
 export const PI_TURN_PREFIX_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
 Summarize the prefix to provide context for the retained suffix:
@@ -135,7 +134,9 @@ export const PRESERVE_TOOL_SUMMARY_PROMPT = `Create a NEW compact incremental te
 
 Historical Tool Context Checkpoints are immutable preserved context. Do NOT repeat, merge, rewrite, update, summarize, or supersede them.
 
-The original user messages and visible assistant responses are preserved verbatim elsewhere and remain in the model context. Do NOT summarize, paraphrase, restate, reinterpret, or quote them.
+The original user messages and completed assistant responses are preserved verbatim elsewhere and remain in the model context. Do NOT summarize, paraphrase, restate, reinterpret, or quote them.
+
+The final user-role message containing this checkpoint instruction is synthetic cache-compact control text, not a historical user message. Do NOT count it when assigning user-message ordinals, quote or summarize it, or create a "### User message N" section for it.
 
 Assistant thinking/reasoning is intentionally discarded. Do NOT preserve it or promote claims that appear only in thinking. Include a fact only when it is evidenced by tool activity/results or by repository/runtime state observed through tools.
 
@@ -165,10 +166,10 @@ For each user message that has scoped tool activity, use this format:
 Omit user messages with no scoped tool activity. Keep exact file paths, identifiers, commands, counts, output values, and error text when they materially support a result. Keep the checkpoint compact and factual.`
 
 export type SummaryPromptOptions = {
-/** Replace the default handoff instruction. */
-summaryPrompt?: string
-/** Summarize only tool-derived state; dialogue is restored verbatim and reasoning is discarded. */
-preserveDialogue?: boolean
+  /** Replace the default handoff instruction. */
+  summaryPrompt?: string
+  /** Summarize only tool-derived state; dialogue is restored verbatim and reasoning is discarded. */
+  preserveDialogue?: boolean
 }
 
 /**
@@ -206,7 +207,7 @@ export type SummaryAskArgs = SummaryPromptOptions & {
   focus?: string
   /** Absolute user-message ordinals that own tool activity in this preserve delta. */
   preserveUserMessageOrdinals?: readonly number[]
-  }
+}
 
 /**
  * Compose the user turn that asks for the summary.
@@ -222,10 +223,10 @@ export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
   const base =
     args.summaryPrompt?.trim() ||
     (args.preserveDialogue
-    ? PRESERVE_TOOL_SUMMARY_PROMPT
-    : args.previous
-    ? PI_UPDATE_SUMMARY_PROMPT
-    : PI_SUMMARY_PROMPT)
+      ? PRESERVE_TOOL_SUMMARY_PROMPT
+      : args.previous
+        ? PI_UPDATE_SUMMARY_PROMPT
+        : PI_SUMMARY_PROMPT)
   const parts = [
     base,
     // Pi's prompt does not say this (Pi declares no tools at all, so its model
@@ -238,9 +239,9 @@ export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
   const focus = args.focus?.trim()
   if (focus) parts.push(`Additional focus: ${focus}`)
   if (args.preserveDialogue && args.preserveUserMessageOrdinals?.length) {
-  parts.push(
-  `This checkpoint contains new tool activity for absolute user-message ordinal(s): ${args.preserveUserMessageOrdinals.join(", ")}. Use these exact ordinals in the \"### User message N\" headings. If tool activity continues a user turn that began before the latest checkpoint, its original user message may be outside the new delta; keep using the listed absolute ordinal instead of renumbering from the visible delta.`,
-  )
+    parts.push(
+      `This checkpoint contains new tool activity for absolute user-message ordinal(s): ${args.preserveUserMessageOrdinals.join(", ")}. Use ONLY these exact ordinals in the "### User message N" headings and do not create any other user-message heading. If tool activity continues a user turn that began before the latest checkpoint, its original user message may be outside the new delta; keep using the listed absolute ordinal instead of renumbering from the visible delta.`,
+    )
   }
   const scope = (boundary: SummaryBoundary, closing: string): string =>
     `Cover the conversation only up to and including the ${boundary.role} message that begins:\n\n"${boundary.snippet}"\n\n${closing}`
@@ -285,53 +286,29 @@ export function renderSummaryAsk(args: SummaryAskArgs = {}): string {
  * First `limit` characters of a message's visible text, whitespace collapsed —
  * enough for a model to locate the message in its own context.
  */
-export const PRESERVE_DYNAMIC_COMPACTION_RATIO = 0.9
-export const PRESERVE_DYNAMIC_HEADROOM_MARGIN_TOKENS = 2048
-
-export type PreserveCompactionBudget = {
-  preservedTokens: number
-  availableTokens: number
-  occupiedTokens: number
-  thresholdTokens: number
-  pressure: number
-  shouldCompact: boolean
-}
+const DEFAULT_PRESERVE_RESERVE_TOKENS = 16_384
 
 /**
- * Decide when preserve-dialogue should compact proactively.
+ * Context-scaled reserve owned by preserve mode.
  *
- * Preserved user messages and visible assistant prose can never be reclaimed.
- * Remove them and the summary headroom from the model window, then compact
- * once 90% of that remaining budget is occupied.
+ * This fitted curve is the single preserve-mode threshold policy. A checkpoint
+ * starts when the projected next context enters the final reserveTokens.
  */
-export function preserveCompactionBudget(args: {
-  contextTokens: number
-  contextWindow: number
-  preservedTokens: number
-  headroomTokens: number
-  ratio?: number
-}): PreserveCompactionBudget {
-  const contextWindow = Math.max(0, args.contextWindow)
-  const contextTokens = Math.max(0, args.contextTokens)
-  const preservedTokens = Math.min(Math.max(0, args.preservedTokens), contextWindow)
-  const headroomTokens = Math.max(0, args.headroomTokens)
-  const ratio = Math.min(1, Math.max(0, args.ratio ?? PRESERVE_DYNAMIC_COMPACTION_RATIO))
-  const availableTokens = Math.max(0, contextWindow - preservedTokens - headroomTokens)
-  const occupiedTokens = Math.max(0, contextTokens - preservedTokens)
-  const thresholdTokens = Math.floor(availableTokens * ratio)
-  const pressure = availableTokens > 0 ? occupiedTokens / availableTokens : Number.POSITIVE_INFINITY
-
-  return {
-    preservedTokens,
-    availableTokens,
-    occupiedTokens,
-    thresholdTokens,
-    pressure,
-    shouldCompact: occupiedTokens > 0 && occupiedTokens >= thresholdTokens,
+export function preserveReserveTokens(contextWindow: number | undefined): number {
+  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return DEFAULT_PRESERVE_RESERVE_TOKENS
   }
+  const window = Math.floor(contextWindow)
+  const fitted = Math.round(
+    88_319.65 + (1_468.926 - 88_319.65) / (1 + Math.pow(window / 1_413_076, 0.7096055)),
+  )
+  return Math.min(window, Math.max(1, fitted))
 }
 
+// reserveTokens is the only preserve-mode compaction threshold.
 export type SummaryRequestShape = "continuation" | "continuation-request" | "dropped"
+
+// No independent automatic-summary minimum: reserveTokens is the policy.
 
 export type SummaryRequestPlan = {
   /** Messages the request sends, ask excluded. */
@@ -385,12 +362,12 @@ export type SummaryRequestPlan = {
  * and this module stays pure (type-only SDK imports).
  */
 export function planSummaryRequest(args: {
-  /** Explicit `summaryMaxTokens` from config; overrides the derived ceiling. */
-  summaryMaxTokens?: number
   /** The full projection: every message the conversation currently has. */
   liveMessages: Message[]
-  /** The messages of the last live provider request (a prefix of the above). */
+  /** The messages of the previous live provider request (a prefix of the above). */
   requestMessages: Message[]
+  /** Exact server-reported prompt tokens for requestMessages, when available. */
+  requestPromptTokens?: number
   droppedMessages: Message[]
   /** Messages that stay in the context verbatim after the boundary. */
   keptCount?: number
@@ -406,41 +383,63 @@ export function planSummaryRequest(args: {
   options: SummaryPromptOptions & { continuation?: boolean }
   customInstructions?: string
   contextWindow?: number
-  /** Explicit `summaryMaxTokens`; when absent the cap is derived below. */
+  /** Legacy non-preserve output cap. Preserve mode ignores it. */
   maxTokens?: number
   reserveTokens?: number
   modelMaxTokens?: number
-  /** Tokens of state actually replaced by the new checkpoint, when narrower than droppedMessages. */
-  reclaimedTokens?: number
   /** Absolute user-message ordinals covered by this preserve delta. */
   preserveUserMessageOrdinals?: readonly number[]
-  }): SummaryRequestPlan {
-  // Resolve the output ceiling once, from Pi's rule bounded by what this
-  // compaction reclaims, so the fit checks and the request agree on it.
+}): SummaryRequestPlan {
+  // Resolve the output ceiling once from the active mode's policy so every fit
+  // check and the actual request use the same ceiling.
   // One scale for every estimate in this decision, calibrated against the
   // server's own reported prompt size where one is available.
   const scale = tokenScale(args.liveMessages)
-  const maxTokens = summaryOutputCap({
-    configured: args.summaryMaxTokens ?? args.maxTokens,
+  const reserveMaxTokens = summaryOutputCap({
     reserveTokens: args.reserveTokens,
     modelMaxTokens: args.modelMaxTokens,
-    droppedTokens:
-    args.reclaimedTokens ?? Math.ceil(estimateMessagesTokens(args.droppedMessages) * scale),
+    preserveDialogue: args.options.preserveDialogue,
   })
-  const fits = (messages: readonly unknown[]): boolean =>
-    continuationFits({
+  const maxTokens =
+    args.options.preserveDialogue === true
+      ? reserveMaxTokens
+      : Math.max(1, Math.min(reserveMaxTokens, args.maxTokens ?? Number.POSITIVE_INFINITY))
+  const fitAsk = renderSummaryAsk({
+    summaryPrompt: args.options.summaryPrompt,
+    preserveDialogue: args.options.preserveDialogue,
+    previous: Boolean(args.previousSummary),
+    focus: args.customInstructions,
+    preserveUserMessageOrdinals: args.preserveUserMessageOrdinals,
+  })
+  const preserveMinimumOutput = 1
+  type SummaryCandidate = {
+    shape: SummaryRequestShape
+    messages: Message[]
+    reportedPrefixTokens?: number
+  }
+  const outputBudget = (candidate: SummaryCandidate): number | undefined =>
+    continuationOutputBudget({
+      contextWindow: args.contextWindow,
+      messages: candidate.messages,
+      scale,
+      ask: fitAsk,
+      ...(candidate.reportedPrefixTokens === undefined
+        ? {}
+        : { reportedPrefixTokens: candidate.reportedPrefixTokens }),
+    })
+  const fits = (candidate: SummaryCandidate): boolean => {
+    if (args.options.preserveDialogue === true) {
+      const budget = outputBudget(candidate)
+      return budget === undefined || budget >= preserveMinimumOutput
+    }
+    return continuationFits({
       contextWindow: args.contextWindow,
       maxTokens,
-      messages,
+      messages: candidate.messages,
       scale,
-      ask: renderSummaryAsk({
-      summaryPrompt: args.options.summaryPrompt,
-      preserveDialogue: args.options.preserveDialogue,
-      previous: Boolean(args.previousSummary),
-      focus: args.customInstructions,
-      preserveUserMessageOrdinals: args.preserveUserMessageOrdinals,
-      }),
+      ask: fitAsk,
     })
+  }
 
   const droppedCount = args.droppedMessages.length
   const keptCount = args.keptCount ?? args.liveMessages.length - droppedCount
@@ -449,31 +448,48 @@ export function planSummaryRequest(args: {
   // with `droppedCount` is insufficient when preserveDialogue has restored
   // older dialogue before Pi's native projected prefix.
   const requiredRequestCount = Math.max(0, args.liveMessages.length - keptCount)
-  const candidates: { shape: SummaryRequestShape; messages: Message[] }[] = []
-if (args.options.continuation !== false) {
-  const wholeLiveIsScope = args.options.preserveDialogue === true
-  if (args.liveMessages.length > 0 && (wholeLiveIsScope || args.liveMessages.length > droppedCount)) {
-    candidates.push({ shape: "continuation", messages: args.liveMessages })
+  const candidates: SummaryCandidate[] = []
+  if (args.options.preserveDialogue === true) {
+    const usePreviousProviderPrefix =
+      args.requestMessages.length >= requiredRequestCount &&
+      args.requestMessages.length > 0 &&
+      args.requestMessages.length < args.liveMessages.length
+    candidates.push({
+      shape: usePreviousProviderPrefix ? "continuation-request" : "continuation",
+      messages: usePreviousProviderPrefix ? args.requestMessages : args.liveMessages,
+      ...(usePreviousProviderPrefix && args.requestPromptTokens !== undefined
+        ? { reportedPrefixTokens: args.requestPromptTokens }
+        : {}),
+    })
+  } else {
+    if (args.options.continuation !== false) {
+      if (args.liveMessages.length > droppedCount) {
+        candidates.push({ shape: "continuation", messages: args.liveMessages })
+      }
+      if (args.requestMessages.length >= requiredRequestCount && args.requestMessages.length > 0) {
+        candidates.push({ shape: "continuation-request", messages: args.requestMessages })
+      }
+    }
+    candidates.push({ shape: "dropped", messages: args.droppedMessages })
   }
-  // Preserve mode summarizes every tool interaction that exists at compaction
-  // time. A shorter last-request continuation can omit fresh tool results that
-  // arrived after that request, so it is not a valid preserve-mode shape.
-  if (
-    !wholeLiveIsScope &&
-    args.requestMessages.length >= requiredRequestCount &&
-    args.requestMessages.length > 0
-  ) {
-    candidates.push({ shape: "continuation-request", messages: args.requestMessages })
-  }
-}
-  candidates.push({ shape: "dropped", messages: args.droppedMessages })
 
   const chosen =
-    candidates.find((candidate) => candidate.shape !== "dropped" && fits(candidate.messages)) ??
-    candidates.find((candidate) => fits(candidate.messages)) ??
+    candidates.find((candidate) => candidate.shape !== "dropped" && fits(candidate)) ??
+    candidates.find((candidate) => fits(candidate)) ??
     candidates[0]
-  const rewindFallback = chosen.shape === "dropped" && args.options.continuation !== false
-const requestFits = fits(chosen.messages)
+  const rewindFallback =
+    args.options.preserveDialogue !== true &&
+    chosen.shape === "dropped" &&
+    args.options.continuation !== false
+  let requestFits = fits(chosen)
+  let requestMaxTokens = maxTokens
+  if (args.options.preserveDialogue === true) {
+    const budget = outputBudget(chosen)
+    requestFits = budget === undefined || budget >= preserveMinimumOutput
+    if (requestFits && budget !== undefined) {
+      requestMaxTokens = Math.max(1, Math.min(maxTokens, Math.floor(budget)))
+    }
+  }
 
   const boundaryFor = (messages: readonly unknown[]): SummaryBoundary | undefined => {
     const last = messages[messages.length - 1]
@@ -491,11 +507,11 @@ const requestFits = fits(chosen.messages)
   // model may not summarize: nothing is retained when the shape is `dropped`
   // (a rewind) or when the conversation kept no tail at all.
   const boundary =
-args.options.preserveDialogue === true
-? undefined
-: chosen.shape !== "dropped" && keptCount > 0
-? boundaryFor(args.droppedMessages)
-: undefined
+    args.options.preserveDialogue === true
+      ? undefined
+      : chosen.shape !== "dropped" && keptCount > 0
+        ? boundaryFor(args.droppedMessages)
+        : undefined
 
   let split: SummaryRequestPlan["split"]
   const turnPrefixCount = args.turnPrefixCount ?? 0
@@ -513,17 +529,17 @@ args.options.preserveDialogue === true
   return {
     messages: chosen.messages,
     droppedMessages: args.droppedMessages,
-    maxTokens,
+    maxTokens: requestMaxTokens,
     rewindFallback,
     requestFits,
     ask: renderSummaryAsk({
-    summaryPrompt: args.options.summaryPrompt,
-    preserveDialogue: args.options.preserveDialogue,
-    previous: Boolean(args.previousSummary),
-    focus: args.customInstructions,
-    preserveUserMessageOrdinals: args.preserveUserMessageOrdinals,
-    ...(boundary ? { boundary } : undefined),
-    ...(split ? { split } : undefined),
+      summaryPrompt: args.options.summaryPrompt,
+      preserveDialogue: args.options.preserveDialogue,
+      previous: Boolean(args.previousSummary),
+      focus: args.customInstructions,
+      preserveUserMessageOrdinals: args.preserveUserMessageOrdinals,
+      ...(boundary ? { boundary } : undefined),
+      ...(split ? { split } : undefined),
     }),
     shape: chosen.shape,
     ...(boundary ? { boundary } : undefined),
@@ -680,19 +696,19 @@ function marginFor(estimated: number, explicit: number | undefined): number {
  * estimated. Without reported usage the whole request is estimated, which is
  * pessimistic but safe.
  */
-export function continuationFits(args: {
+function continuationOutputBudget(args: {
   contextWindow: number | undefined
-  maxTokens: number
   messages: readonly unknown[]
   ask: string
   marginTokens?: number
+  /** Exact token count of messages when they are a previously sent provider prefix. */
+  reportedPrefixTokens?: number
   /** See `tokenScale`: multiplies the estimated (not the reported) part. */
   scale?: number
-}): boolean {
-  // An unknown window cannot be checked; allow it rather than disabling the
-  // cache-friendly shape on every custom provider that omits the field.
-  if (typeof args.contextWindow !== "number" || !Number.isFinite(args.contextWindow)) return true
-  if (args.contextWindow - args.maxTokens <= 0) return false
+}): number | undefined {
+  // An unknown window cannot be checked; leave the caller's output ceiling alone.
+  if (typeof args.contextWindow !== "number" || !Number.isFinite(args.contextWindow))
+    return undefined
 
   let reported = 0
   let reportedIndex = -1
@@ -707,17 +723,46 @@ export function continuationFits(args: {
 
   const scale = args.scale && args.scale > 0 ? args.scale : 1
   const askTokens = Math.ceil(estimatedTokens(args.ask) * scale)
+  if (
+    typeof args.reportedPrefixTokens === "number" &&
+    Number.isFinite(args.reportedPrefixTokens) &&
+    args.reportedPrefixTokens >= 0
+  ) {
+    return Math.max(
+      0,
+      args.contextWindow -
+        Math.floor(args.reportedPrefixTokens) -
+        askTokens -
+        marginFor(askTokens, args.marginTokens),
+    )
+  }
   // The reported number covers the prompt *before* the message that carries it,
   // so that message counts toward the estimate along with everything after it.
   let estimated = askTokens
   if (reportedIndex < 0) {
     for (const message of args.messages) estimated += Math.ceil(estimatedTokens(message) * scale)
-    return estimated + args.maxTokens + marginFor(estimated, args.marginTokens) <= args.contextWindow
+    return Math.max(0, args.contextWindow - estimated - marginFor(estimated, args.marginTokens))
   }
   for (const message of args.messages.slice(reportedIndex)) {
     estimated += Math.ceil(estimatedTokens(message) * scale)
   }
-  return reported + estimated + args.maxTokens + marginFor(estimated, args.marginTokens) <= args.contextWindow
+  return Math.max(
+    0,
+    args.contextWindow - reported - estimated - marginFor(estimated, args.marginTokens),
+  )
+}
+
+export function continuationFits(args: {
+  contextWindow: number | undefined
+  maxTokens: number
+  messages: readonly unknown[]
+  ask: string
+  marginTokens?: number
+  /** See `tokenScale`: multiplies the estimated (not the reported) part. */
+  scale?: number
+}): boolean {
+  const budget = continuationOutputBudget(args)
+  return budget === undefined || args.maxTokens <= budget
 }
 
 export interface ProjectedEntryLike {
@@ -819,6 +864,21 @@ export function summaryRejection(response: SummaryCheck): string | undefined {
   return undefined
 }
 
+export function preserveSummaryOrdinalRejection(
+summary: string,
+allowedOrdinals: readonly number[],
+): string | undefined {
+const allowed = new Set(allowedOrdinals)
+const found = new Set<number>()
+for (const match of summary.matchAll(/^### User message (\d+)\s*$/gim)) {
+found.add(Number(match[1]))
+}
+const unexpected = [...found].filter((ordinal) => !allowed.has(ordinal))
+if (unexpected.length > 0) {
+  return `the preserve summary invented user-message heading(s): ${unexpected.join(", ")}`
+}
+return undefined
+}
 /**
  * Tool-call syntax that arrived as *text* rather than as a parsed tool call.
  * Seen in practice: a model asked to summarize replied with
@@ -828,7 +888,9 @@ export function summaryRejection(response: SummaryCheck): string | undefined {
  * conversation prefix.
  */
 export function looksLikeToolCall(text: string): boolean {
-  return /<tool_call>|<\|tool_call\|>|<function=|<tool_use>|<function_calls>|\[tool_call\]/i.test(text)
+  return /<tool_call>|<\|tool_call\|>|<function=|<tool_use>|<function_calls>|\[tool_call\]/i.test(
+    text,
+  )
 }
 
 /**
@@ -934,38 +996,25 @@ export function replayableHeaders(
 }
 
 /**
- * The output ceiling for a summary request.
+ * Technical output ceiling for a summary request.
  *
- * Pi derives its ceiling from the headroom it keeps below the context window —
- * `min(floor(0.8 * reserveTokens), model.maxTokens)` — and that is worth
- * keeping: a ceiling is not a target (the model only writes what it needs), so
- * a generous one costs nothing and prevents the expensive failure, a reply
- * truncated at the cap, which is rejected and throws the summary away.
- *
- * Pi's proxy is not quite the invariant it looks like, though: it never
- * references what the compaction reclaims, and for a split turn Pi applies it
- * twice (0.8 and 0.5 of the same reserve) to two concatenated summaries, so the
- * artifact can exceed the reserve it is meant to respect. So the ceiling is
- * additionally bounded by half of what this compaction drops — a checkpoint can
- * never be larger than what it replaces — with a floor for the model's thinking
- * tokens.
+ * Preserve mode has one sizing policy: reserveTokens. The request planner clips
+ * that ceiling again to the real space left by the previous provider prefix and
+ * the appended summary ask. Non-preserve mode keeps Pi's 0.8 x reserve behavior.
  */
 export function summaryOutputCap(args: {
-  /** `summaryMaxTokens` from config: an explicit value skips all of this. */
-  configured?: number
   reserveTokens?: number
   modelMaxTokens?: number
-  /** Estimated tokens in the span this compaction discards. */
-  droppedTokens?: number
+  preserveDialogue?: boolean
 }): number {
-  if (args.configured) return args.configured
-  const piCap = Math.min(
-    Math.floor(0.8 * (args.reserveTokens ?? 16_384)),
-    args.modelMaxTokens && args.modelMaxTokens > 0 ? args.modelMaxTokens : Number.POSITIVE_INFINITY,
-  )
-  if (!args.droppedTokens || args.droppedTokens <= 0) return piCap
-  const reclaimedCap = Math.max(2048, Math.floor(0.5 * args.droppedTokens))
-  return Math.max(1, Math.min(piCap, reclaimedCap))
+  const reserveTokens = args.reserveTokens ?? DEFAULT_PRESERVE_RESERVE_TOKENS
+  const reserveCap =
+    args.preserveDialogue === true
+      ? Math.max(1, Math.floor(Math.max(0, reserveTokens)))
+      : Math.max(1, Math.floor(0.8 * Math.max(0, reserveTokens)))
+  const modelCap =
+    args.modelMaxTokens && args.modelMaxTokens > 0 ? args.modelMaxTokens : Number.POSITIVE_INFINITY
+  return Math.max(1, Math.min(reserveCap, modelCap))
 }
 
 /** Only the shape this module needs; Pi's `FileOperations` matches it. */

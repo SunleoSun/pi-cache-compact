@@ -23,6 +23,8 @@ export type CacheCompactDetails = {
     number?: number
     /** Absolute user-message ordinals whose new tool activity this checkpoint covers. */
     coveredUserMessages?: number[]
+    /** First raw branch entry deliberately left after this checkpoint. */
+    rawTailStartEntryId?: string
   }
 }
 
@@ -38,14 +40,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function hasPreserveMarker(details: unknown): details is CacheCompactDetails {
   if (!isRecord(details)) return false
   const marker = details.cacheCompact
-  return (
-    isRecord(marker) &&
-    marker.mode === PRESERVE_DIALOGUE_MODE &&
-    marker.version === 1
-  )
+  return isRecord(marker) && marker.mode === PRESERVE_DIALOGUE_MODE && marker.version === 1
 }
 
-export function isPreserveDialogueCompaction(entry: SessionEntry | undefined): entry is CompactionEntry<CacheCompactDetails> {
+export function isPreserveDialogueCompaction(
+  entry: SessionEntry | undefined,
+): entry is CompactionEntry<CacheCompactDetails> {
   return entry?.type === "compaction" && hasPreserveMarker(entry.details)
 }
 
@@ -74,7 +74,10 @@ function latestEdits(branchEntries: readonly SessionEntry[]): Map<string, Contex
   return edits
 }
 
-function isEntryRemoved(entry: SessionEntry, edits: ReadonlyMap<string, ContextEditEntry>): boolean {
+function isEntryRemoved(
+  entry: SessionEntry,
+  edits: ReadonlyMap<string, ContextEditEntry>,
+): boolean {
   if (!("id" in entry) || typeof entry.id !== "string") return false
   return edits.get(entry.id)?.replacement === null
 }
@@ -82,44 +85,46 @@ function isEntryRemoved(entry: SessionEntry, edits: ReadonlyMap<string, ContextE
 /**
  * Active preserve checkpoints in model-visible order.
  *
- * A legacy preserve-marked Pi compaction is a baseline checkpoint: raw tool
- * traffic before it must stay hidden, while user/assistant dialogue before it
- * is restored separately. Append-only custom checkpoints after that baseline
- * are all retained. Old custom checkpoints nulled by pre-append-only versions
- * remain ignored for restart compatibility.
+ * A legacy preserve-marked Pi compaction is an aggregate baseline: it supersedes
+ * earlier checkpoint summaries while user/assistant dialogue before it is restored.
+ * Modern manual preserve compactions carry an explicit checkpoint ordinal and are
+ * append-only, so earlier active custom/manual checkpoints remain visible. Old
+ * custom checkpoints nulled by pre-append-only versions remain ignored.
  */
 export function preserveDialogueStates(
   branchEntries: readonly SessionEntry[],
 ): PreserveDialogueState[] {
   const edits = latestEdits(branchEntries)
-  let lastCompactionIndex = -1
-  for (let index = branchEntries.length - 1; index >= 0; index -= 1) {
-    if (branchEntries[index]?.type === "compaction") {
-      lastCompactionIndex = index
-      break
-    }
-  }
-
   const states: PreserveDialogueState[] = []
-  if (lastCompactionIndex >= 0) {
-    const baseline = branchEntries[lastCompactionIndex]
-    if (isPreserveDialogueCompaction(baseline)) {
-      states.push({
-        entry: baseline,
-        index: lastCompactionIndex,
-        summary: baseline.summary,
-        details: baseline.details,
-      })
-    }
-  }
 
-  for (let index = Math.max(0, lastCompactionIndex + 1); index < branchEntries.length; index += 1) {
+  for (let index = 0; index < branchEntries.length; index += 1) {
     const entry = branchEntries[index]
+    if (entry.type === "compaction") {
+      if (!isPreserveDialogueCompaction(entry)) {
+        states.length = 0
+        continue
+      }
+      const state = {
+        entry,
+        index,
+        summary: entry.summary,
+        details: entry.details,
+      }
+      // Legacy preserve compactions were aggregate baselines and therefore
+      // supersede earlier checkpoint state. Modern manual preserve compactions
+      // carry an explicit checkpoint ordinal and are append-only checkpoints:
+      // retain the earlier immutable states and append this one.
+      if (typeof entry.details?.checkpoint?.number !== "number") states.length = 0
+      states.push(state)
+      continue
+    }
+
     if (!isPreserveDialogueCheckpoint(entry) || isEntryRemoved(entry, edits)) continue
     const checkpoint = entry.details.checkpoint
     if (!checkpoint) continue
     states.push({ entry, index, summary: checkpoint.summary, details: entry.details })
   }
+
   return states
 }
 
@@ -129,29 +134,64 @@ export function latestPreserveDialogueState(
   return preserveDialogueStates(branchEntries).at(-1)
 }
 
-function applyEdit(message: AgentMessage, edit: ContextEditEntry | undefined): AgentMessage | undefined {
+function applyEdit(
+  message: AgentMessage,
+  edit: ContextEditEntry | undefined,
+): AgentMessage | undefined {
   if (!edit) return message
   if (edit.replacement === null) return undefined
 
-  if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult" && message.role !== "custom") {
+  if (
+    message.role !== "user" &&
+    message.role !== "assistant" &&
+    message.role !== "toolResult" &&
+    message.role !== "custom"
+  ) {
     return message
   }
 
   const replacement = edit.replacement.content
   const content =
-    (message.role === "assistant" || message.role === "toolResult") && typeof replacement === "string"
+    (message.role === "assistant" || message.role === "toolResult") &&
+    typeof replacement === "string"
       ? [{ type: "text", text: replacement }]
       : replacement
   return { ...message, content } as AgentMessage
 }
 
-function entryMessages(
-  entry: SessionEntry,
-  edit: ContextEditEntry | undefined,
-): AgentMessage[] {
+function entryTimestampMs(entry: SessionEntry): number | undefined {
+  if (!("timestamp" in entry)) return undefined
+  const value = entry.timestamp
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value !== "string") return undefined
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function checkpointProjectionTimestamp(branchEntries: readonly SessionEntry[]): string {
+  let latest = 0
+  for (const entry of branchEntries) {
+    const entryTimestamp = entryTimestampMs(entry)
+    if (entryTimestamp !== undefined) latest = Math.max(latest, entryTimestamp)
+    if (entry.type === "message" && Number.isFinite(entry.message.timestamp)) {
+      latest = Math.max(latest, entry.message.timestamp)
+    }
+  }
+  return new Date((latest > 0 ? latest : Date.now()) + 1).toISOString()
+}
+
+function entryMessages(entry: SessionEntry, edit: ContextEditEntry | undefined): AgentMessage[] {
+  const checkpointTimestamp = isPreserveDialogueCheckpoint(entry)
+    ? entryTimestampMs(entry)
+    : undefined
   return sessionEntryToContextMessages(entry)
     .map((message) => applyEdit(message, edit))
     .filter((message): message is AgentMessage => message !== undefined)
+    .map((message) =>
+      checkpointTimestamp === undefined
+        ? message
+        : ({ ...message, timestamp: checkpointTimestamp } as AgentMessage),
+    )
 }
 
 function preservedDialogueMessage(
@@ -164,19 +204,44 @@ function preservedDialogueMessage(
 
   if (edited.role === "user") return edited
   if (edited.role !== "assistant") return undefined
+  if (edited.stopReason !== "stop") return undefined
+  if (!Array.isArray(edited.content)) return undefined
+  if (edited.content.some((block) => block.type === "toolCall")) return undefined
 
-  const content = Array.isArray(edited.content)
-    ? edited.content.filter((block) => block.type === "text")
-    : []
+  const content = edited.content.filter((block) => block.type === "text")
   if (content.length === 0) return undefined
 
   return { ...edited, content } as AgentMessage
 }
 
+function preservedContextDialogueMessage(
+  entry: SessionEntry,
+  edit: ContextEditEntry | undefined,
+): AgentMessage | undefined {
+  const message = preservedDialogueMessage(entry, edit)
+  if (!message || message.role !== "assistant") return message
+
+  // Provider usage belongs to the pre-checkpoint prompt. Keeping it on restored
+  // historical prose makes Pi's context estimator treat removed raw tool state
+  // as if it were still present and can clamp the first post-checkpoint reply
+  // to one token. Keep the prose/timestamp, but make that stale usage ineligible.
+  return {
+    ...message,
+    usage: {
+      ...message.usage,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+    },
+  } as AgentMessage
+}
+
 /**
- * User messages + visible assistant prose only. This intentionally excludes
- * checkpoints so callers can account dialogue and checkpoint tokens separately.
- */
+* User messages + completed assistant replies only. Tool-use/interrupted assistant
+* text stays technical state. Checkpoints are accounted separately.
+*/
 export function preservedDialogueMessages(
   branchEntries: readonly SessionEntry[],
   endExclusive = branchEntries.length,
@@ -193,14 +258,6 @@ export function preservedDialogueMessages(
   return dialogue
 }
 
-function legacyBaselineIndex(branchEntries: readonly SessionEntry[]): number {
-  for (let index = branchEntries.length - 1; index >= 0; index -= 1) {
-    const entry = branchEntries[index]
-    if (entry?.type !== "compaction") continue
-    return isPreserveDialogueCompaction(entry) ? index : -1
-  }
-  return -1
-}
 
 /**
  * Every immutable preserve checkpoint currently visible to the model.
@@ -230,7 +287,9 @@ export function preservedCheckpointMessages(
         role: "compactionSummary",
         summary: state.summary,
         tokensBefore: state.entry.tokensBefore,
-        timestamp: Number.isFinite(Date.parse(state.entry.timestamp)) ? Date.parse(state.entry.timestamp) : 0,
+        timestamp: Number.isFinite(Date.parse(state.entry.timestamp))
+          ? Date.parse(state.entry.timestamp)
+          : 0,
       } as AgentMessage)
     }
   }
@@ -239,7 +298,7 @@ export function preservedCheckpointMessages(
 
 /**
  * Permanent preserve-mode model context, in original branch order:
- * user messages, visible assistant prose, and every active immutable tool
+ * user messages, completed assistant replies, and every active immutable tool
  * checkpoint. Raw tool traffic/reasoning is excluded.
  */
 export function preservedContextMessages(
@@ -247,75 +306,98 @@ export function preservedContextMessages(
   endExclusive = branchEntries.length,
 ): AgentMessage[] {
   const edits = latestEdits(branchEntries)
-  const baseline = legacyBaselineIndex(branchEntries)
-  const out: AgentMessage[] = []
-  let start = 0
-
-  if (baseline >= 0) {
-  const beforeBaselineEnd = Math.min(endExclusive, baseline)
-  for (let index = 0; index < beforeBaselineEnd; index += 1) {
-  const entry = branchEntries[index]
-  const preserved = preservedDialogueMessage(
-  entry,
-  entry.type === "message" ? edits.get(entry.id) : undefined,
+  const states = new Map(
+    preserveDialogueStates(branchEntries).map((state) => [state.index, state] as const),
   )
-  if (preserved) out.push(preserved)
-  }
+  const out: AgentMessage[] = []
 
-  if (baseline < endExclusive) {
-  const baselineEntry = branchEntries[baseline]
-  if (isPreserveDialogueCompaction(baselineEntry)) {
-  const converted = entryMessages(baselineEntry, undefined)
-  if (converted.length > 0) out.push(...converted)
-  else {
-  out.push({
-  role: "compactionSummary",
-  summary: baselineEntry.summary,
-  tokensBefore: baselineEntry.tokensBefore,
-  timestamp: Number.isFinite(Date.parse(baselineEntry.timestamp)) ? Date.parse(baselineEntry.timestamp) : 0,
-  } as AgentMessage)
-  }
-  start = baseline + 1
-  }
-  }
-  }
-  for (let index = start; index < Math.min(endExclusive, branchEntries.length); index += 1) {
+  for (let index = 0; index < Math.min(endExclusive, branchEntries.length); index += 1) {
     const entry = branchEntries[index]
     if (entry.type === "message") {
-      const preserved = preservedDialogueMessage(entry, edits.get(entry.id))
+      const preserved = preservedContextDialogueMessage(entry, edits.get(entry.id))
       if (preserved) out.push(preserved)
       continue
     }
-    if (isPreserveDialogueCheckpoint(entry) && !isEntryRemoved(entry, edits)) {
-      out.push(...entryMessages(entry, edits.get(entry.id)))
+
+    const state = states.get(index)
+    if (!state) continue
+    if (isPreserveDialogueCheckpoint(state.entry)) {
+      out.push(...entryMessages(state.entry, edits.get(state.entry.id)))
+      continue
+    }
+
+    if (state.entry.type === "compaction") {
+      const converted = entryMessages(state.entry, undefined)
+      if (converted.length > 0) {
+        out.push(...converted)
+      } else {
+        out.push({
+          role: "compactionSummary",
+          summary: state.summary,
+          tokensBefore: state.entry.tokensBefore,
+          timestamp: Number.isFinite(Date.parse(state.entry.timestamp))
+            ? Date.parse(state.entry.timestamp)
+            : 0,
+        } as AgentMessage)
+      }
     }
   }
+
   return out
 }
 
-/** Raw model-visible messages created after the latest immutable checkpoint. */
+function rawTailStartIndex(
+  branchEntries: readonly SessionEntry[],
+  state: PreserveDialogueState | undefined,
+): number | undefined {
+  const id = state?.details?.checkpoint?.rawTailStartEntryId
+  if (!id) return undefined
+  const index = branchEntries.findIndex((entry) => "id" in entry && entry.id === id)
+  return index >= 0 ? index : undefined
+}
+
+function preserveDeltaStartIndex(branchEntries: readonly SessionEntry[]): number {
+  const latest = latestPreserveDialogueState(branchEntries)
+  const tail = rawTailStartIndex(branchEntries, latest)
+  return tail ?? (latest ? latest.index + 1 : 0)
+}
+
+function entryIndexOrEnd(
+  branchEntries: readonly SessionEntry[],
+  entryId: string | undefined,
+): number {
+  if (!entryId) return branchEntries.length
+  const index = branchEntries.findIndex((entry) => "id" in entry && entry.id === entryId)
+  return index >= 0 ? index : branchEntries.length
+}
+
+/** Raw model-visible messages not yet owned by an immutable checkpoint. */
 export function preserveDialogueDeltaMessages(
   branchEntries: readonly SessionEntry[],
+  endExclusiveEntryId?: string,
 ): AgentMessage[] {
-  const latest = latestPreserveDialogueState(branchEntries)
   const edits = latestEdits(branchEntries)
-  const start = latest ? latest.index + 1 : 0
+  const start = preserveDeltaStartIndex(branchEntries)
+  const end = entryIndexOrEnd(branchEntries, endExclusiveEntryId)
   return branchEntries
-    .slice(start)
-    .flatMap((entry) => entryMessages(entry, "id" in entry ? edits.get(entry.id as string) : undefined))
+    .slice(start, end)
+    .filter((entry) => !isPreserveDialogueCheckpoint(entry))
+    .flatMap((entry) =>
+      entryMessages(entry, "id" in entry ? edits.get(entry.id as string) : undefined),
+    )
 }
 
 export type PreserveDeltaScope = {
-checkpointCount: number
-nextCheckpointNumber: number
-coveredUserMessages: number[]
-/** Branch entries that contain compactable raw state in this delta, in order. */
-rawEntryIds: string[]
-/** First branch entry that contains compactable raw state in this delta. */
-firstRawEntryId?: string
-/** Last branch entry that contains compactable raw state in this delta. */
-lastRawEntryId?: string
-rawEntryCount: number
+  checkpointCount: number
+  nextCheckpointNumber: number
+  coveredUserMessages: number[]
+  /** Branch entries that contain compactable raw state in this delta, in order. */
+  rawEntryIds: string[]
+  /** First branch entry that contains compactable raw state in this delta. */
+  firstRawEntryId?: string
+  /** Last branch entry that contains compactable raw state in this delta. */
+  lastRawEntryId?: string
+  rawEntryCount: number
 }
 
 /**
@@ -324,90 +406,100 @@ rawEntryCount: number
  * loop continues the same user turn across checkpoints.
  */
 export function preserveDeltaScope(
-branchEntries: readonly SessionEntry[],
+  branchEntries: readonly SessionEntry[],
+  endExclusiveEntryId?: string,
 ): PreserveDeltaScope {
-const latest = latestPreserveDialogueState(branchEntries)
-const edits = latestEdits(branchEntries)
-const start = latest ? latest.index + 1 : 0
-let userNumber = 0
-const covered = new Set<number>()
-const rawEntryIds: string[] = []
+  const edits = latestEdits(branchEntries)
+  const start = preserveDeltaStartIndex(branchEntries)
+  const end = entryIndexOrEnd(branchEntries, endExclusiveEntryId)
+  let userNumber = 0
+  const covered = new Set<number>()
+  const rawEntryIds: string[] = []
 
-for (let index = 0; index < branchEntries.length; index += 1) {
-const entry = branchEntries[index]
-if (entry?.type !== "message") continue
-const edited = applyEdit(entry.message, edits.get(entry.id))
-if (!edited) continue
-if (edited.role === "user") {
-userNumber += 1
-continue
-}
-if (index < start) continue
+  for (let index = 0; index < branchEntries.length; index += 1) {
+    const entry = branchEntries[index]
+    if (entry?.type !== "message") continue
+    const edited = applyEdit(entry.message, edits.get(entry.id))
+    if (!edited) continue
+    if (edited.role === "user") {
+      userNumber += 1
+      continue
+    }
+    if (index < start || index >= end) continue
 
-let isRaw = false
-if (edited.role === "toolResult") {
-isRaw = true
-if (userNumber > 0) covered.add(userNumber)
-} else if (edited.role === "assistant" && Array.isArray(edited.content)) {
-isRaw = edited.content.some((block) => block.type !== "text")
-if (edited.content.some((block) => block.type === "toolCall") && userNumber > 0) {
-covered.add(userNumber)
-}
-} else if (edited.role !== "assistant") {
-// Preserve mode only keeps user messages and visible assistant text. Any
-// other model-visible message in the delta is technical state to compact.
-isRaw = true
+    let isRaw = false
+    if (edited.role === "toolResult") {
+      isRaw = true
+      if (userNumber > 0) covered.add(userNumber)
+    } else if (edited.role === "assistant") {
+    const content = Array.isArray(edited.content) ? edited.content : []
+    const completedReply = preservedDialogueMessage(entry, edits.get(entry.id))
+    isRaw = completedReply === undefined || content.some((block) => block.type !== "text")
+    if (content.some((block) => block.type === "toolCall") && userNumber > 0) {
+    covered.add(userNumber)
+    }
+    }
+    // Assistant reasoning/tool calls and assistant text that is not a completed
+    // reply are compactable raw state, as are tool results. System/developer/custom
+    // protocol messages are context, not evidence that a tool checkpoint is needed.
+
+    if (isRaw) rawEntryIds.push(entry.id)
+  }
+
+  const checkpointCount = preserveDialogueStates(branchEntries).length
+  return {
+    checkpointCount,
+    nextCheckpointNumber: checkpointCount + 1,
+    coveredUserMessages: [...covered],
+    rawEntryIds,
+    ...(rawEntryIds.length === 0
+      ? {}
+      : { firstRawEntryId: rawEntryIds[0], lastRawEntryId: rawEntryIds.at(-1)! }),
+    rawEntryCount: rawEntryIds.length,
+  }
 }
 
-if (isRaw) rawEntryIds.push(entry.id)
-}
-
-const checkpointCount = preserveDialogueStates(branchEntries).length
-return {
-checkpointCount,
-nextCheckpointNumber: checkpointCount + 1,
-coveredUserMessages: [...covered],
-rawEntryIds,
-...(rawEntryIds.length === 0
-? {}
-: { firstRawEntryId: rawEntryIds[0], lastRawEntryId: rawEntryIds.at(-1)! }),
-rawEntryCount: rawEntryIds.length,
-}
-}
-
-  export type PreserveBoundaryDraft =
+export type PreserveBoundaryDraft =
   | { type: "context_edit"; targetId: string; replacement: ContextEditEntry["replacement"] }
-  | { type: "custom_message"; customType: string; content: string; display: boolean; details?: unknown }
+  | {
+      type: "custom_message"
+      customType: string
+      content: string
+      display: boolean
+      details?: unknown
+    }
 
 export function preserveDialogueBoundaryEntries(args: {
   branchEntries: readonly SessionEntry[]
   summary: string
   tokensBefore: number
   details: CacheCompactDetails
+  rawTailStartEntryId?: string
 }): PreserveBoundaryDraft[] {
-  const latest = latestPreserveDialogueState(args.branchEntries)
   const edits = latestEdits(args.branchEntries)
-  const scope = preserveDeltaScope(args.branchEntries)
+  const scope = preserveDeltaScope(args.branchEntries, args.rawTailStartEntryId)
   const drafts: PreserveBoundaryDraft[] = []
-  const start = latest ? latest.index + 1 : 0
+  const start = preserveDeltaStartIndex(args.branchEntries)
+  const end = entryIndexOrEnd(args.branchEntries, args.rawTailStartEntryId)
 
-  for (const entry of args.branchEntries.slice(start)) {
-    if (entry.type !== "message") continue
-    const edited = applyEdit(entry.message, edits.get(entry.id))
-    if (!edited) continue
-    if (edited.role === "toolResult") {
-      drafts.push({ type: "context_edit", targetId: entry.id, replacement: null })
-      continue
-    }
-    if (edited.role !== "assistant") continue
-    const content = Array.isArray(edited.content)
-      ? edited.content.filter((block) => block.type === "text")
-      : []
-    drafts.push({
-      type: "context_edit",
-      targetId: entry.id,
-      replacement: content.length > 0 ? { content } : null,
-    })
+  for (const entry of args.branchEntries.slice(start, end)) {
+  if (entry.type !== "message") continue
+  const edited = applyEdit(entry.message, edits.get(entry.id))
+  if (!edited) continue
+  if (edited.role === "toolResult") {
+  drafts.push({ type: "context_edit", targetId: entry.id, replacement: null })
+  continue
+  }
+  if (edited.role !== "assistant") continue
+  const preserved = preservedDialogueMessage(entry, edits.get(entry.id))
+  drafts.push({
+  type: "context_edit",
+  targetId: entry.id,
+  replacement:
+  preserved?.role === "assistant" && Array.isArray(preserved.content)
+  ? { content: preserved.content }
+  : null,
+  })
   }
 
   const details: CacheCompactDetails = {
@@ -417,12 +509,13 @@ export function preserveDialogueBoundaryEntries(args: {
       tokensBefore: args.tokensBefore,
       number: scope.nextCheckpointNumber,
       coveredUserMessages: scope.coveredUserMessages,
+      ...(args.rawTailStartEntryId ? { rawTailStartEntryId: args.rawTailStartEntryId } : {}),
     },
   }
   drafts.push({
     type: "custom_message",
     customType: PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
-    content: `## Tool Context Checkpoint #${scope.nextCheckpointNumber}\n\n${args.summary}`,
+    content: "## Tool Context Checkpoint #" + scope.nextCheckpointNumber + "\n\n" + args.summary,
     display: false,
     details,
   })
@@ -431,16 +524,17 @@ export function preserveDialogueBoundaryEntries(args: {
 
 /**
  * Preview the non-system model context after a successful preserve checkpoint.
- * It is all immutable dialogue/checkpoints plus the newly appended checkpoint;
- * no pre-checkpoint tool/reasoning state remains raw.
+ * Older technical state is replaced by the new immutable checkpoint while the
+ * triggering assistant/tool batch remains raw immediately after it.
  */
 export function previewPreservedContextAfterCheckpoint(args: {
   branchEntries: readonly SessionEntry[]
   summary: string
   tokensBefore: number
   details: CacheCompactDetails
+  rawTailStartEntryId?: string
 }): AgentMessage[] {
-  const scope = preserveDeltaScope(args.branchEntries)
+  const scope = preserveDeltaScope(args.branchEntries, args.rawTailStartEntryId)
   const details: CacheCompactDetails = {
     ...args.details,
     checkpoint: {
@@ -448,18 +542,31 @@ export function previewPreservedContextAfterCheckpoint(args: {
       tokensBefore: args.tokensBefore,
       number: scope.nextCheckpointNumber,
       coveredUserMessages: scope.coveredUserMessages,
+      ...(args.rawTailStartEntryId ? { rawTailStartEntryId: args.rawTailStartEntryId } : {}),
     },
   }
   const checkpoint = {
     type: "custom_message",
+    timestamp: checkpointProjectionTimestamp(args.branchEntries),
     customType: PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
-    content: `## Tool Context Checkpoint #${scope.nextCheckpointNumber}\n\n${args.summary}`,
+    content: "## Tool Context Checkpoint #" + scope.nextCheckpointNumber + "\n\n" + args.summary,
     display: false,
     details,
   } as SessionEntry
+  const tailStart = entryIndexOrEnd(args.branchEntries, args.rawTailStartEntryId)
+  const edits = latestEdits(args.branchEntries)
+  const tail = args.rawTailStartEntryId
+    ? args.branchEntries
+        .slice(tailStart)
+        .filter((entry) => !isPreserveDialogueCheckpoint(entry))
+        .flatMap((entry) =>
+          entryMessages(entry, "id" in entry ? edits.get(entry.id as string) : undefined),
+        )
+    : []
   return [
-    ...preservedContextMessages(args.branchEntries),
+    ...preservedContextMessages(args.branchEntries, tailStart),
     ...entryMessages(checkpoint, undefined),
+    ...tail,
   ]
 }
 
@@ -471,13 +578,34 @@ export function rebuildPreservedDialogue(
   if (!latest) return undefined
 
   const edits = latestEdits(branchEntries)
+  const tailStart = rawTailStartIndex(branchEntries, latest)
+  if (tailStart !== undefined && tailStart < latest.index) {
+    const preserved = preservedContextMessages(branchEntries, tailStart)
+    const checkpoint = entryMessages(
+      latest.entry,
+      "id" in latest.entry ? edits.get(latest.entry.id as string) : undefined,
+    )
+    const rawTail = branchEntries
+      .slice(tailStart, latest.index)
+      .filter((entry) => !isPreserveDialogueCheckpoint(entry))
+      .flatMap((entry) =>
+        entryMessages(entry, "id" in entry ? edits.get(entry.id as string) : undefined),
+      )
+    const afterCheckpoint = branchEntries
+      .slice(latest.index + 1)
+      .flatMap((entry) =>
+        entryMessages(entry, "id" in entry ? edits.get(entry.id as string) : undefined),
+      )
+    return [...preserved, ...checkpoint, ...rawTail, ...afterCheckpoint]
+  }
+
   const preserved = preservedContextMessages(branchEntries, latest.index + 1)
   const afterCheckpoint = branchEntries
     .slice(latest.index + 1)
-    .flatMap((entry) => entryMessages(entry, "id" in entry ? edits.get(entry.id as string) : undefined))
+    .flatMap((entry) =>
+      entryMessages(entry, "id" in entry ? edits.get(entry.id as string) : undefined),
+    )
 
-  // Legacy compaction entries can fail to convert outside Pi's projected view.
-  // `preservedContextMessages` synthesizes their summary in that case.
   if (preserved.length === 0 && currentMessages.length === 0) return undefined
   return [...preserved, ...afterCheckpoint]
 }

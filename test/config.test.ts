@@ -14,12 +14,12 @@ test("parseOptions keeps valid fields and drops unknown or wrongly typed ones", 
       summaryModel: { provider: "mock", id: "small" },
       summaryPrompt: " do it ",
       preserveDialogue: true,
-      summaryMaxTokens: 512.9,
+      obsoleteSummaryMaxTokens: 512.9,
       summaryReasoningEffort: "minimal",
       cacheRetention: "long",
       toolChoice: "none",
       debug: true,
-      debugFile: "  /tmp/cc.jsonl  ",
+      debugFile: " /tmp/cc.jsonl ",
       debugPayloads: true,
       deferAfterCacheMiss: true,
       nonsense: "ignored",
@@ -30,7 +30,6 @@ test("parseOptions keeps valid fields and drops unknown or wrongly typed ones", 
       summaryModel: { provider: "mock", id: "small" },
       summaryPrompt: " do it ",
       preserveDialogue: true,
-      summaryMaxTokens: 512,
       summaryReasoningEffort: "minimal",
       cacheRetention: "long",
       toolChoice: "none",
@@ -44,11 +43,16 @@ test("parseOptions keeps valid fields and drops unknown or wrongly typed ones", 
 test("parseOptions rejects malformed values without throwing", () => {
   assert.deepEqual(parseOptions(null), {})
   assert.deepEqual(parseOptions("nope"), {})
-  assert.deepEqual(parseOptions({ models: [], summaryMaxTokens: -3, cacheRetention: "forever" }), {})
-  assert.deepEqual(parseOptions({ summaryReasoningEffort: "none" }), { summaryReasoningEffort: "none" })
+  assert.deepEqual(
+    parseOptions({ models: [], obsoleteSummaryMaxTokens: -3, cacheRetention: "forever" }),
+    {},
+  )
+  assert.deepEqual(parseOptions({ summaryReasoningEffort: "none" }), {
+    summaryReasoningEffort: "none",
+  })
   assert.deepEqual(parseOptions({ summaryReasoningEffort: 42 }), {})
   assert.deepEqual(parseOptions({ summaryModel: { provider: "mock" } }), {})
-  assert.deepEqual(parseOptions({ debugFile: "   " }), {})
+  assert.deepEqual(parseOptions({ debugFile: " " }), {})
   assert.deepEqual(parseOptions({ debugFile: 42 }), {})
   assert.deepEqual(parseOptions({ debugPayloads: "yes" }), {})
   assert.deepEqual(parseOptions({ preserveDialogue: "yes" }), {})
@@ -60,13 +64,15 @@ test("readOptions merges files in order with the later file winning", () => {
   try {
     const personal = path.join(dir, "personal.json")
     const project = path.join(dir, "project.json")
-    fs.writeFileSync(personal, JSON.stringify({ summaryMaxTokens: 100, summaryReasoningEffort: "low", debug: true }))
-    fs.writeFileSync(project, JSON.stringify({ summaryMaxTokens: 200, enabled: false }))
+    fs.writeFileSync(
+      personal,
+      JSON.stringify({ obsoleteSummaryMaxTokens: 100, summaryReasoningEffort: "low", debug: true }),
+    )
+    fs.writeFileSync(project, JSON.stringify({ obsoleteSummaryMaxTokens: 200, enabled: false }))
 
     const merged = readOptions([personal, path.join(dir, "missing.json"), project])
     assert.deepEqual(merged, {
-preserveDialogue: true,
-summaryMaxTokens: 200,
+      preserveDialogue: true,
       summaryReasoningEffort: "low",
       debug: true,
       enabled: false,
@@ -103,12 +109,11 @@ test("a sparse project file cannot undo continuation from the personal file", ()
     const personal = path.join(dir, "personal.json")
     const project = path.join(dir, "project.json")
     fs.writeFileSync(personal, JSON.stringify({ continuation: false, rewindWhenNeeded: true }))
-    fs.writeFileSync(project, JSON.stringify({ summaryMaxTokens: 200 }))
+    fs.writeFileSync(project, JSON.stringify({ ignoredUnknownSetting: 200 }))
     assert.deepEqual(readOptions([personal, project]), {
-preserveDialogue: true,
-continuation: false,
+      preserveDialogue: true,
+      continuation: false,
       rewindWhenNeeded: true,
-      summaryMaxTokens: 200,
     })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -116,20 +121,24 @@ continuation: false,
 })
 
 test("readOptions enables preserveDialogue by default and explicit false overrides it", () => {
-assert.deepEqual(readOptions([]), { preserveDialogue: true })
+  assert.deepEqual(readOptions([]), { preserveDialogue: true })
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-"))
-try {
-const file = path.join(dir, "cache-compact.json")
-fs.writeFileSync(file, JSON.stringify({ preserveDialogue: false }))
-assert.deepEqual(readOptions([file]), { preserveDialogue: false })
-} finally {
-fs.rmSync(dir, { recursive: true, force: true })
-}
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-"))
+  try {
+    const file = path.join(dir, "cache-compact.json")
+    fs.writeFileSync(file, JSON.stringify({ preserveDialogue: false }))
+    assert.deepEqual(readOptions([file]), { preserveDialogue: false })
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
-test("summaryReasoningEffort accepts \"off\"", () => {
-  assert.deepEqual(parseOptions({ summaryReasoningEffort: "off" }), { summaryReasoningEffort: "off" })
-  assert.deepEqual(parseOptions({ summaryReasoningEffort: "none" }), { summaryReasoningEffort: "none" })
+test('summaryReasoningEffort accepts "off"', () => {
+  assert.deepEqual(parseOptions({ summaryReasoningEffort: "off" }), {
+    summaryReasoningEffort: "off",
+  })
+  assert.deepEqual(parseOptions({ summaryReasoningEffort: "none" }), {
+    summaryReasoningEffort: "none",
+  })
   assert.deepEqual(parseOptions({ summaryReasoningEffort: "turbo" }), {})
 })

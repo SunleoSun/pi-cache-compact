@@ -15,7 +15,8 @@ import { existsSync, readFileSync } from "node:fs"
 
 export type CacheRetention = "none" | "short" | "long"
 
-export type SummaryReasoningEffort = "off" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+export type SummaryReasoningEffort =
+  "off" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 
 export interface CacheCompactOptions {
   /** Set false to disable the extension entirely. */
@@ -32,19 +33,13 @@ export interface CacheCompactOptions {
   summaryModel?: { provider: string; id: string }
   /** Replace the default handoff instruction. */
   summaryPrompt?: string
-/**
-* Keep historical user messages and visible assistant text verbatim in
-* future model context. Compaction summarizes only removed tool-derived
-* state; assistant reasoning is discarded. Default true.
-*/
-preserveDialogue?: boolean
   /**
-   * Cap on the summary's output tokens. Default 8192. Must fit the whole
-   * reply: on reasoning models the thinking tokens count against this cap,
-   * and a reply truncated at the cap is rejected (Pi's cold default then
-   * runs). 2048 was too small for 100k+ sessions on thinking-enabled servers.
+   * Keep historical user messages and completed assistant responses verbatim in
+   * future model context. Compaction summarizes only removed tool-derived
+   * state; assistant reasoning is discarded. Default true.
    */
-  summaryMaxTokens?: number
+  preserveDialogue?: boolean
+  /** Summary sizing in preserve mode is derived from reserveTokens. */
   /**
    * Force a reasoning effort on the summarization request. `"off"` sends no
    * `reasoning_effort` field at all, which is the closest thing to "do not
@@ -64,8 +59,8 @@ preserveDialogue?: boolean
    * so any mismatch against the cached live prefix — including "omitted",
    * a third variant distinct from every explicit level — misses the prefix
    * cache entirely. That is why the value is mirrored from the wire instead
-   * of being configured, and why thinking pressure should be answered by
-   * raising `summaryMaxTokens`, not by lowering effort.
+   * of being configured. The automatic context-scaled summary budget should
+   * normally be left in control rather than compensated for with this setting.
    */
   summaryReasoningEffort?: SummaryReasoningEffort
   /**
@@ -104,7 +99,7 @@ preserveDialogue?: boolean
    * a server that caches arbitrary shared prefixes.
    */
   rewindWhenNeeded?: boolean
-/** Master debug switch. Default false; when false, debugFile is never created or touched. */
+  /** Master debug switch. Default false; when false, debugFile is never created or touched. */
   debug?: boolean
   /**
    * JSONL file that structured debug records are appended to (requires
@@ -118,13 +113,14 @@ preserveDialogue?: boolean
    */
   debugFile?: string
   /**
-   * With `debug` + `debugFile`: additionally dump the *full request payloads*
-   * around a compaction — the last live request before it (`variant:
-   * "live_before"`), our summary request (`variant: "summarization"`), and the
-   * first live request after it (`variant: "live_after"`) — as `payload_dump`
-   * records. Fingerprints tell you *where* two requests diverge; dumps tell
-   * you *what* differs. These records contain the whole conversation, so the
-   * option is opt-in and the file must not be committed or shared. Use
+   * With `debug` + `debugFile`: additionally dump request payloads around a
+   * compaction — the last live request before it (`variant: "live_before"`),
+   * our summary request (`variant: "summarization"`), and the first live
+   * request after it (`variant: "live_after"`) — as `payload_dump` records.
+   * Full top-level tool declarations are never persisted: dumps keep tool names
+   * only, while `provider_request.toolsHash` retains a compact schema-change
+   * fingerprint. Dumps still contain the conversation, so the option is opt-in
+   * and the file must not be committed or shared. Use
    * `scripts/compare-dumps.mjs` to diff a pair. Only the last live request is
    * retained in memory between requests; nothing is written unless a
    * compaction actually happens.
@@ -148,11 +144,7 @@ function stringArray(value: unknown): string[] | undefined {
   return strings.length > 0 ? strings : undefined
 }
 
-function positiveInt(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined
-  const rounded = Math.floor(value)
-  return rounded > 0 ? rounded : undefined
-}
+// No independent preserve summary-size setting.
 
 function summaryModel(value: unknown): { provider: string; id: string } | undefined {
   if (!isRecord(value)) return undefined
@@ -171,8 +163,14 @@ function toolChoice(value: unknown): "none" | "auto" | undefined {
 }
 
 function reasoningEffort(value: unknown): SummaryReasoningEffort | undefined {
-  return value === "off" || value === "none" || value === "minimal" || value === "low" ||
-    value === "medium" || value === "high" || value === "xhigh" || value === "max"
+  return value === "off" ||
+    value === "none" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh" ||
+    value === "max"
     ? value
     : undefined
 }
@@ -189,9 +187,8 @@ export function parseOptions(raw: unknown): CacheCompactOptions {
   if (typeof raw.summaryPrompt === "string" && raw.summaryPrompt.trim()) {
     options.summaryPrompt = raw.summaryPrompt
   }
-if (typeof raw.preserveDialogue === "boolean") options.preserveDialogue = raw.preserveDialogue
-  const maxTokens = positiveInt(raw.summaryMaxTokens)
-  if (maxTokens) options.summaryMaxTokens = maxTokens
+  if (typeof raw.preserveDialogue === "boolean") options.preserveDialogue = raw.preserveDialogue
+  // Preserve summary sizing is derived from reserveTokens.
   const effort = reasoningEffort(raw.summaryReasoningEffort)
   if (effort) options.summaryReasoningEffort = effort
   const retention = cacheRetention(raw.cacheRetention)
@@ -199,7 +196,7 @@ if (typeof raw.preserveDialogue === "boolean") options.preserveDialogue = raw.pr
   const choice = toolChoice(raw.toolChoice)
   if (choice) options.toolChoice = choice
   if (typeof raw.continuation === "boolean") options.continuation = raw.continuation
-if (typeof raw.rewindWhenNeeded === "boolean") options.rewindWhenNeeded = raw.rewindWhenNeeded
+  if (typeof raw.rewindWhenNeeded === "boolean") options.rewindWhenNeeded = raw.rewindWhenNeeded
   if (typeof raw.debug === "boolean") options.debug = raw.debug
   if (typeof raw.debugFile === "string" && raw.debugFile.trim()) {
     options.debugFile = raw.debugFile.trim()
