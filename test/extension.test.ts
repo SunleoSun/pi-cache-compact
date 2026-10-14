@@ -607,6 +607,106 @@ test("preserveDialogue never proactively compacts a tool-free final turn", async
   }
 })
 
+test("preserveDialogue compacts older raw state after a tool-free length turn", async () => {
+const ws = tempWorkspace({ preserveDialogue: true })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const oldAssistant = assistant(
+[
+{ type: "text", text: "INTERMEDIATE TOOL TEXT" },
+{ type: "toolCall", id: "call-old", name: "read", arguments: {} },
+] as any,
+"toolUse",
+)
+const oldResult = {
+role: "toolResult",
+toolCallId: "call-old",
+toolName: "read",
+content: [{ type: "text", text: "CARRIED RAW RESULT".repeat(300) }],
+isError: false,
+timestamp: 3,
+}
+const currentAssistant = {
+...assistant(
+[{ type: "thinking", thinking: "CURRENT TRUNCATED REASONING" }] as any,
+"length",
+),
+usage: {
+input: 56_172,
+output: 1,
+cacheRead: 0,
+cacheWrite: 0,
+reasoning: 1,
+totalTokens: 56_173,
+cost: {},
+},
+}
+const branchEntries = [
+{
+type: "message",
+id: "u1",
+message: { role: "user", content: "PERMANENT USER REQUIREMENT", timestamp: 1 },
+},
+{ type: "message", id: "a-old", message: oldAssistant },
+{ type: "message", id: "t-old", message: oldResult },
+{ type: "message", id: "a-current", message: currentAssistant },
+]
+const { handlers, ctx, calls } = setup({
+cwd: ws.cwd,
+branchEntries,
+messages: [
+{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+branchEntries[0].message,
+oldAssistant,
+oldResult,
+currentAssistant,
+],
+contextUsage: { tokens: 56_173, contextWindow: 50_000, percent: 112.346 },
+model: { provider: "mock", id: "test-model", contextWindow: 50_000 },
+hasUI: true,
+})
+
+const result = await handlers.get("turn_end")!(
+{
+type: "turn_end",
+turnIndex: 2,
+message: currentAssistant,
+toolResults: [],
+messageEntryId: "a-current",
+toolResultEntryIds: [],
+entries: [],
+continue: false,
+},
+ctx,
+)
+
+assert.equal(calls.complete.length, 1)
+const summaryRequest = JSON.stringify(calls.complete[0].context.messages)
+assert.match(summaryRequest, /CARRIED RAW RESULT/)
+assert.doesNotMatch(summaryRequest, /CURRENT TRUNCATED REASONING/)
+assert.match(summaryRequest, /Summarize the supplied technical context/)
+assert.equal(calls.complete[0].context.messages[0].role, "system")
+assert.ok(
+result.entries.some(
+(entry: any) => entry.type === "context_edit" && entry.targetId === "t-old",
+),
+)
+assert.equal(
+result.entries.some(
+(entry: any) => entry.type === "context_edit" && entry.targetId === "a-current",
+),
+false,
+)
+assert.equal(result.entries.at(-1).customType, "cache-compact-preserve-checkpoint")
+assert.match(
+calls.notifications.find((notice) => /compact complete/.test(notice.message))!.message,
+ /newest raw kept: ~[1-9]\d* tok/,
+)
+} finally {
+ws.cleanup()
+}
+})
+
 test("preserveDialogue reports reserve-threshold compaction and keeps the newest tool batch raw", async () => {
   const ws = tempWorkspace({ preserveDialogue: true })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir

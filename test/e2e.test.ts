@@ -25,6 +25,7 @@ import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
 import { rollingMessageHashes, sharedPrefixLength } from "../src/debug.ts"
+import { PRESERVE_RECOVERY_SYSTEM_PROMPT } from "../src/build.ts"
 
 const enabled =
   process.env.PI_CACHE_COMPACT_E2E === "1" ||
@@ -58,9 +59,16 @@ function lastMessage(body: any): any {
   return [...(body?.messages ?? [])].reverse()[0]
 }
 
-function startMockModel(promptTokens = 910) {
-  const requests: Recorded[] = []
-  let toolCalls = 0
+function startMockModel(
+promptTokens = 910,
+options: {
+lengthOnceWhen?: (body: any, requestIndex: number) => boolean
+lengthPromptTokens?: number
+} = {},
+) {
+const requests: Recorded[] = []
+let toolCalls = 0
+let lengthResponses = 0
 
   const server = http.createServer((req, res) => {
     let raw = ""
@@ -82,13 +90,9 @@ function startMockModel(promptTokens = 910) {
       } catch {
         /* ignore */
       }
+      const requestIndex = requests.length
       requests.push({ body, headers: req.headers })
 
-      const usage = {
-        prompt_tokens: promptTokens,
-        completion_tokens: 10,
-        total_tokens: promptTokens + 10,
-      }
       const model = body.model ?? "test-model"
       const last = lastMessage(body)
       const lastText = textOf(last?.content)
@@ -98,10 +102,24 @@ function startMockModel(promptTokens = 910) {
           /technical checkpoint ONLY from tool activity/i.test(lastText) ||
           /technical tool-context checkpoint/i.test(lastText))
       const wantsTool =
-        !isSummary &&
-        last?.role === "user" &&
-        lastText.includes(MARKER) &&
-        Array.isArray(body.tools)
+      !isSummary &&
+      last?.role === "user" &&
+      lastText.includes(MARKER) &&
+      Array.isArray(body.tools)
+      const shouldLength =
+      !isSummary &&
+      lengthResponses === 0 &&
+      options.lengthOnceWhen?.(body, requestIndex) === true
+      if (shouldLength) lengthResponses += 1
+      const effectivePromptTokens =
+      shouldLength && options.lengthPromptTokens !== undefined
+      ? options.lengthPromptTokens
+      : promptTokens
+      const usage = {
+      prompt_tokens: effectivePromptTokens,
+      completion_tokens: shouldLength ? 1 : 10,
+      total_tokens: effectivePromptTokens + (shouldLength ? 1 : 10),
+      }
       const toolCallId = `call_${toolCalls + 1}`
       const summaryText = `${SUMMARY_TEXT} #${toolCalls}`
 
@@ -116,39 +134,41 @@ function startMockModel(promptTokens = 910) {
       })
 
       if (body.stream === false) {
-        res.writeHead(200, { "content-type": "application/json" })
-        const message = isSummary
-          ? { role: "assistant", content: summaryText }
-          : wantsTool
-            ? {
-                role: "assistant",
-                content: null,
-                tool_calls: [
-                  {
-                    id: toolCallId,
-                    type: "function",
-                    function: { name: "read", arguments: '{"path":"probe.txt"}' },
-                  },
-                ],
-              }
-            : { role: "assistant", content: "done" }
-        res.end(
-          JSON.stringify({
-            id: "chatcmpl-1",
-            object: "chat.completion",
-            created: Date.now(),
-            model,
-            choices: [
-              {
-                index: 0,
-                message,
-                finish_reason: wantsTool ? "tool_calls" : "stop",
-              },
-            ],
-            usage,
-          }),
-        )
-        return
+      res.writeHead(200, { "content-type": "application/json" })
+      const message = isSummary
+      ? { role: "assistant", content: summaryText }
+      : shouldLength
+      ? { role: "assistant", content: "I" }
+      : wantsTool
+      ? {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+      {
+      id: toolCallId,
+      type: "function",
+      function: { name: "read", arguments: '{"path":"probe.txt"}' },
+      },
+      ],
+      }
+      : { role: "assistant", content: "done" }
+      res.end(
+      JSON.stringify({
+      id: "chatcmpl-1",
+      object: "chat.completion",
+      created: Date.now(),
+      model,
+      choices: [
+      {
+      index: 0,
+      message,
+      finish_reason: shouldLength ? "length" : wantsTool ? "tool_calls" : "stop",
+      },
+      ],
+      usage,
+      }),
+      )
+      return
       }
 
       res.writeHead(200, {
@@ -157,8 +177,20 @@ function startMockModel(promptTokens = 910) {
         connection: "keep-alive",
       })
 
+      if (shouldLength) {
+      res.write(
+      sse(
+      chunk([{ index: 0, delta: { role: "assistant", content: "I" }, finish_reason: null }]),
+      ),
+      )
+      res.write(sse(chunk([{ index: 0, delta: {}, finish_reason: "length" }], { usage })))
+      res.write("data: [DONE]\n\n")
+      res.end()
+      return
+      }
+
       if (wantsTool) {
-        toolCalls++
+      toolCalls++
         res.write(
           sse(
             chunk([
@@ -605,7 +637,255 @@ test(
 )
 
 test(
-  "certification: preserveDialogue keeps dialogue verbatim and leaves the newest tool batch raw",
+"certification: preserve recovery rewind keeps the exact technical delta and rebuilds the next live context",
+{ skip: enabled ? false : "set PI_CACHE_COMPACT_E2E=1 to run (spawns pi)", timeout: 180_000 },
+async () => {
+const firstOutput = "FIRST RECOVERY-CERT TOOL OUTPUT\n"
+const recoveryOutput = "RECOVERY TOOL OUTPUT\n" + "r".repeat(40_000)
+const mock = await startMockModel(37_000, {
+lengthPromptTokens: 56_172,
+lengthOnceWhen: (body) => {
+const serialized = JSON.stringify(body?.messages ?? [])
+const ask = textOf(lastMessage(body)?.content)
+return (
+serialized.includes("## Tool Context Checkpoint #1") &&
+serialized.includes("RECOVERY TOOL OUTPUT") &&
+!/technical checkpoint ONLY from tool activity/i.test(ask) &&
+!/technical tool-context checkpoint/i.test(ask)
+)
+},
+})
+const debugFile = path.join(
+fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-recovery-")),
+"debug.jsonl",
+)
+const firstPrompt = `${MARKER} RECOVERY CERT USER 1: preserve exactly`
+const secondPrompt = `${MARKER} RECOVERY CERT USER 2: preserve exactly`
+const finalPrompt = "RECOVERY CERT FINAL PROBE"
+let run: Awaited<ReturnType<typeof runPi>> | undefined
+try {
+run = await runPi(mock, {
+debugFile,
+thinking: "low",
+preserveDialogue: true,
+contextWindow: 50_000,
+prompt: firstPrompt,
+probeContent: firstOutput,
+})
+const root = run.root
+run = await runPi(mock, {
+debugFile,
+thinking: "low",
+preserveDialogue: true,
+contextWindow: 50_000,
+root,
+prompt: secondPrompt,
+probeContent: recoveryOutput,
+})
+const recoveryRun = run
+run = await runPi(mock, {
+debugFile,
+thinking: "low",
+preserveDialogue: true,
+contextWindow: 50_000,
+root,
+prompt: finalPrompt,
+})
+
+const context = `recovery run exited with ${recoveryRun.code}; final run exited with ${run.code}\n--- recovery stderr ---\n${recoveryRun.stderr}\n--- final stderr ---\n${run.stderr}\n--- requests ---\n${dump(mock.requests)}`
+const isToolSummaryRequest = (request: Recorded | undefined): boolean =>
+Boolean(
+request &&
+(/technical checkpoint ONLY from tool activity/i.test(
+textOf(lastMessage(request.body)?.content),
+) ||
+/technical tool-context checkpoint/i.test(textOf(lastMessage(request.body)?.content))),
+)
+const summaryIndexes = mock.requests
+.map((request, index) => (isToolSummaryRequest(request) ? index : -1))
+.filter((index) => index >= 0)
+assert.equal(
+summaryIndexes.length,
+2,
+`expected normal checkpoint + recovery checkpoint, got ${summaryIndexes.length}\n${context}`,
+)
+
+const firstSummaryIndex = summaryIndexes[0]
+const recoverySummaryIndex = summaryIndexes[1]
+const firstSummaryReq = mock.requests[firstSummaryIndex]
+const recoveryReq = mock.requests[recoverySummaryIndex]
+const preRecoveryLive = mock.requests[recoverySummaryIndex - 1]
+assert.ok(preRecoveryLive, `no oversized live request before recovery\n${context}`)
+
+// Checkpoint #1 remains the normal cache-friendly path: it summarizes the old
+// batch and deliberately leaves the second batch raw.
+assert.notEqual(textOf(firstSummaryReq.body.messages?.[0]?.content), PRESERVE_RECOVERY_SYSTEM_PROMPT)
+assert.ok(JSON.stringify(firstSummaryReq.body.messages).includes("FIRST RECOVERY-CERT TOOL OUTPUT"))
+assert.ok(!JSON.stringify(firstSummaryReq.body.messages).includes("RECOVERY TOOL OUTPUT"))
+assert.deepEqual(
+mock.requests[firstSummaryIndex - 1].body.messages,
+firstSummaryReq.body.messages.slice(0, mock.requests[firstSummaryIndex - 1].body.messages.length),
+)
+
+// The next live request contains checkpoint #1 + the carried raw second batch
+// and is the request the mock intentionally terminates with finish_reason=length.
+const preRecoverySerialized = JSON.stringify(preRecoveryLive.body.messages)
+assert.ok(preRecoverySerialized.includes("## Tool Context Checkpoint #1"))
+assert.ok(preRecoverySerialized.includes("RECOVERY TOOL OUTPUT"))
+assert.ok(preRecoverySerialized.includes("call_2"))
+
+// Recovery is intentionally cold and minimal: only a tiny recovery system
+// message, the exact technical delta, and the synthetic checkpoint ask.
+assert.equal(textOf(recoveryReq.body.messages?.[0]?.content), PRESERVE_RECOVERY_SYSTEM_PROMPT)
+const recoveryRoles = recoveryReq.body.messages.map((message: any) => message.role)
+assert.ok(
+recoveryRoles[0] === "system" || recoveryRoles[0] === "developer",
+`recovery instruction used unexpected provider role ${recoveryRoles[0]}`,
+)
+assert.deepEqual(
+recoveryRoles.slice(1),
+["assistant", "tool", "user"],
+"recovery request must contain only instruction + exact tool delta + checkpoint ask",
+)
+assert.ok(!Array.isArray(recoveryReq.body.tools) || recoveryReq.body.tools.length === 0)
+assert.ok(!JSON.stringify(recoveryReq.body.messages).includes(firstPrompt))
+assert.ok(!JSON.stringify(recoveryReq.body.messages).includes(secondPrompt))
+assert.ok(!JSON.stringify(recoveryReq.body.messages).includes("FIRST RECOVERY-CERT TOOL OUTPUT"))
+assert.ok(!JSON.stringify(recoveryReq.body.messages).includes(SUMMARY_TEXT))
+assert.equal(
+recoveryReq.body.messages.some((message: any) => textOf(message.content) === "I"),
+false,
+"truncated current assistant leaked into the recovery delta",
+)
+
+const recoveryToolCall = recoveryReq.body.messages.find(
+(message: any) =>
+message.role === "assistant" &&
+Array.isArray(message.tool_calls) &&
+message.tool_calls.some((call: any) => call.id === "call_2"),
+)
+assert.ok(recoveryToolCall, `recovery request lost call_2\n${context}`)
+assert.equal(recoveryToolCall.tool_calls[0].function.name, "read")
+assert.equal(JSON.parse(recoveryToolCall.tool_calls[0].function.arguments).path, "probe.txt")
+const recoveryToolResult = recoveryReq.body.messages.find(
+(message: any) => message.role === "tool" && message.tool_call_id === "call_2",
+)
+assert.ok(recoveryToolResult, `recovery request lost call_2 result\n${context}`)
+const recoveryToolText = textOf(recoveryToolResult.content)
+assert.ok(recoveryToolText.includes("RECOVERY TOOL OUTPUT"))
+assert.ok(
+recoveryToolText.includes("r".repeat(40_000)),
+"recovery request truncated the tool result instead of summarizing the exact delta",
+)
+const recoveryAsk = textOf(lastMessage(recoveryReq.body)?.content)
+assert.match(recoveryAsk, /NEW compact incremental technical checkpoint/i)
+assert.match(recoveryAsk, /absolute user-message ordinal\(s\): 2(?:\D|$)/)
+
+// The next ordinary provider request must use the rebuilt model state. It may
+// happen immediately or on the explicit final probe, but it must exist.
+const postRecoveryLive = mock.requests
+.slice(recoverySummaryIndex + 1)
+.find((request) => !isToolSummaryRequest(request))
+assert.ok(postRecoveryLive, `no ordinary live request after recovery checkpoint\n${context}`)
+const postMessages = postRecoveryLive.body.messages ?? []
+const postSerialized = JSON.stringify(postMessages)
+assert.ok(postSerialized.includes(firstPrompt))
+assert.ok(postSerialized.includes(secondPrompt))
+assert.ok(postSerialized.includes("## Tool Context Checkpoint #1"))
+assert.ok(postSerialized.includes("## Tool Context Checkpoint #2"))
+assert.ok(!postSerialized.includes("FIRST RECOVERY-CERT TOOL OUTPUT"))
+assert.ok(!postSerialized.includes("RECOVERY TOOL OUTPUT"))
+assert.ok(!postSerialized.includes("call_1"))
+assert.ok(!postSerialized.includes("call_2"))
+assert.ok(
+postMessages.some((message: any) => message.role === "assistant" && textOf(message.content) === "I"),
+"current length-stopped assistant tail should remain raw after recovery",
+)
+const postMaxTokens = postRecoveryLive.body.max_tokens ?? postRecoveryLive.body.max_completion_tokens
+assert.equal(typeof postMaxTokens, "number")
+assert.ok(postMaxTokens > 1, `post-recovery response was clamped to ${postMaxTokens}\n${context}`)
+
+// Everything before the compacted raw second batch must remain byte-for-byte
+// identical. The first divergence is the raw call/result being replaced by CP2.
+const beforeHashes = rollingMessageHashes(preRecoveryLive.body.messages ?? [])
+const afterHashes = rollingMessageHashes(postMessages)
+const shared = sharedPrefixLength(beforeHashes, afterHashes)
+assert.ok(shared > 0, `recovery rebuilt context shares no stable prefix\n${context}`)
+assert.deepEqual(
+(preRecoveryLive.body.messages ?? []).slice(0, shared),
+postMessages.slice(0, shared),
+"recovery damaged provider messages before the compacted delta",
+)
+const firstRemoved = JSON.stringify((preRecoveryLive.body.messages ?? [])[shared] ?? {})
+assert.match(
+firstRemoved,
+ /call_2|RECOVERY TOOL OUTPUT/,
+`first divergence is not the compacted technical delta: ${firstRemoved}`,
+)
+
+// The explicit final probe proves Pi can continue normally from the rebuilt state.
+assert.equal(run.code, 0, context)
+const finalLive = [...mock.requests]
+.reverse()
+.find(
+(request) =>
+lastMessage(request.body)?.role === "user" &&
+textOf(lastMessage(request.body)?.content) === finalPrompt,
+)
+assert.ok(finalLive, `no final live request after recovery\n${context}`)
+const finalSerialized = JSON.stringify(finalLive.body.messages)
+assert.ok(finalSerialized.includes(firstPrompt))
+assert.ok(finalSerialized.includes(secondPrompt))
+assert.ok(finalSerialized.includes("## Tool Context Checkpoint #1"))
+assert.ok(finalSerialized.includes("## Tool Context Checkpoint #2"))
+assert.ok(!finalSerialized.includes("RECOVERY TOOL OUTPUT"))
+assert.ok(!finalSerialized.includes("call_2"))
+assert.match(run.stdout, /done/i)
+
+// Raw transcript stays append-only even though the provider context is compact.
+const sessionText = fs
+.readdirSync(run.agentDir, { recursive: true })
+.filter((file) => String(file).endsWith(".jsonl"))
+.map((file) => fs.readFileSync(path.join(run!.agentDir, String(file)), "utf8"))
+.join("\n")
+assert.ok(sessionText.includes(firstOutput.trim()))
+assert.ok(sessionText.includes("RECOVERY TOOL OUTPUT"))
+assert.ok(sessionText.includes("call_2"))
+assert.ok(sessionText.includes("cache-compact-preserve-checkpoint"))
+assert.doesNotMatch(sessionText, /"type":"compaction"/)
+
+// Debug audit certifies the branch actually used recovery-rewind and that the
+// first live payload after CP2 is the context Pi really sent to the provider.
+const debugRecords = fs
+.readFileSync(debugFile, "utf8")
+.split("\n")
+.filter(Boolean)
+.map((line) => JSON.parse(line) as any)
+const summaryStarts = debugRecords.filter((record) => record.kind === "summary_start")
+assert.equal(summaryStarts.length, 2)
+assert.notEqual(summaryStarts[0].requestShape, "recovery-rewind")
+assert.equal(summaryStarts[1].requestShape, "recovery-rewind")
+const compactions = debugRecords.filter((record) => record.kind === "preserve_compaction")
+assert.equal(compactions.length, 2)
+assert.equal(compactions[1].checkpoint.number, 2)
+assert.deepEqual(compactions[1].checkpoint.coveredUserMessages, [2])
+assert.ok(JSON.stringify(compactions[1].contextBefore).includes("RECOVERY TOOL OUTPUT"))
+assert.ok(!JSON.stringify(compactions[1].contextAfter).includes("RECOVERY TOOL OUTPUT"))
+assert.ok(JSON.stringify(compactions[1].contextAfter).includes("I"))
+// Recovery ends the length-stopped print run, so the next live request is made
+// by the resumed Pi process. The mock capture above is therefore the actual
+// provider-level certification; the in-memory post_compaction_context marker
+// cannot survive that process boundary.
+assert.ok(postMessages.length > 0)
+} finally {
+mock.close()
+run?.cleanup()
+}
+},
+)
+
+test(
+"certification: preserveDialogue keeps dialogue verbatim and leaves the newest tool batch raw",
   { skip: enabled ? false : "set PI_CACHE_COMPACT_E2E=1 to run (spawns pi)", timeout: 180_000 },
   async () => {
     const mock = await startMockModel(37_000)

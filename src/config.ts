@@ -92,11 +92,11 @@ export interface CacheCompactOptions {
    */
   continuation?: boolean
   /**
-   * Try the rewinding shape (the dropped span alone) when no continuation fits
-   * the context window, instead of leaving that compaction to Pi. Default
-   * false: a rewind never reused a cache in any measurement and costs a whole
-   * cold prefill, while Pi's own summary is a small prompt. Only enable this on
-   * a server that caches arbitrary shared prefixes.
+   * Try the rewinding shape when no continuation fits instead of leaving that
+   * compaction to Pi. Default false because rewinds lose append-only cache reuse.
+   * Preserve mode has one independent recovery exception: after a `length` turn
+   * whose already-sent provider prefix is too large, it may cold-summarize only
+   * the technical delta so the session can recover.
    */
   rewindWhenNeeded?: boolean
   /** Master debug switch. Default false; when false, debugFile is never created or touched. */

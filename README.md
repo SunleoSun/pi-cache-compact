@@ -30,7 +30,7 @@ List managed packages with `pi list`.
 
 Assistant reasoning, assistant text from tool-use/interrupted/error/length responses, tool calls and tool results are compactable technical state.
 
-Preserve mode checkpoints at a tool-bearing `turn_end`. `reserveTokens` is the only preserve-mode threshold policy and is derived from the smooth fitted curve `round(88319.65 + (1468.926 - 88319.65) / (1 + (contextWindow / 1413076)^0.7096055))`. Because `turn_end` runs after the tool batch is in Pi's projection, a checkpoint starts when Pi's current context usage reaches `contextWindow - reserveTokens`; the batch estimate is used for raw-tail accounting, not added to the already-current context a second time. The newest completed assistant/tool batch is deliberately excluded from the summary and remains raw after the new checkpoint; only older raw tool/reasoning state is compacted. Summary output may use up to `reserveTokens`, clipped by the summarizer model and the request's actual remaining fit. Pi-native compaction is disabled in memory and native threshold/overflow/manual compaction is cancelled in preserve mode. The reserve is refreshed at session start, model selection, and user input, with a model-aware fallback if needed.
+Preserve mode checks at every `turn_end`. `reserveTokens` is the only preserve-mode threshold policy and is derived from the smooth fitted curve `round(88319.65 + (1468.926 - 88319.65) / (1 + (contextWindow / 1413076)^0.7096055))`. Because `turn_end` runs after the current turn is in Pi's projection, a checkpoint starts when Pi's current context usage reaches `contextWindow - reserveTokens` and older raw technical state exists before the current assistant message; the current-batch estimate is used for raw-tail accounting, not added to the already-current context a second time. The current assistant/tool batch is deliberately excluded from the summary and remains raw after the new checkpoint; it becomes eligible at the following turn boundary even if that later turn has no tool results. Summary output may use up to `reserveTokens`, clipped by the summarizer model and the request's actual remaining fit. Pi-native compaction is disabled in memory and native threshold/overflow/manual compaction is cancelled in preserve mode. The reserve is refreshed at session start, model selection, and user input, with a model-aware fallback if needed.
 
 ### Append-only checkpoints
 
@@ -77,7 +77,13 @@ The summary request is normally a strict forward continuation of the live conver
 
 After compaction, divergence should start only where newly compacted raw tool/reasoning state disappeared. User/assistant dialogue and older checkpoints stay stable.
 
-When the newest tool batch crosses the reserve boundary, the summary request continues from the previous provider prefix, before that batch. The batch is then placed raw after the new checkpoint, so it is never sacrificed merely to make the summary fit. The checkpoint's projected model message retains its append timestamp so Pi's context estimator invalidates stale assistant usage from the larger pre-checkpoint prompt before sizing the first post-checkpoint response. If no older compactable state exists, preserve mode does not manufacture a checkpoint; if the newest batch itself fills the physical model window, continuation is stopped rather than delegating to Pi-native compaction.
+When the current batch crosses the reserve boundary, the summary request continues from the previous provider prefix, before that batch. The batch is then placed raw after the new checkpoint, so it is never sacrificed merely to make the summary fit. On the next `turn_end` that carried batch is now older raw state and can be checkpointed even when the model produced no new tool results (for example a `length` stop). If that `length` turn reports a provider prefix that is already too large to append the checkpoint ask, preserve recovery uses a minimal cold rewind containing only a tiny recovery system/developer instruction, the exact compactable technical delta, and the checkpoint instruction; preserved dialogue, historical checkpoints, and the current truncated assistant tail are not copied into that cold request. Normal preserve checkpoints remain forward continuations. Because the recovery request is a brand-new prompt, its fit is estimated from scratch with the conservative UTF-8 bytes/3 baseline and margin: historical provider calibration and `usage` metadata embedded in raw assistant messages belong to the old live prefix and are deliberately ignored for recovery fit. The checkpoint's projected model message retains its append timestamp so Pi's context estimator invalidates stale assistant usage from the larger pre-checkpoint prompt before sizing the first post-checkpoint response. If no older compactable state exists, preserve mode does not manufacture a checkpoint.
+
+### Recovery certification
+
+The test suite includes a real-Pi/provider-level recovery certification, not only a mocked extension handler. It creates one normal preserve checkpoint, carries a large second tool batch raw, makes the next provider request report a 56,172-token prompt against a 50,000-token window and stop with `length`, then exercises the cold recovery rewind. The certification verifies that the recovery request contains the exact tool call ID/name/arguments and the complete 40,000-character tool result, uses the correct absolute owning user ordinal, and excludes preserved dialogue, earlier tool state/checkpoints, and the current truncated assistant tail.
+
+After the recovery checkpoint, the certification starts the next ordinary Pi request from the persisted session and inspects the actual provider payload. It verifies that preserved user dialogue and the earlier immutable checkpoint survive, the provider-message prefix before the compacted raw batch is byte-for-byte unchanged, the old tool call/result are gone from model-visible context, checkpoint #2 appears exactly in their place, the current `length` assistant tail remains raw, output headroom is greater than one token, and the model successfully produces a normal `done` response. The raw JSONL transcript is also checked to retain the original tool call/result, proving that recovery edits model context without destructively rewriting history.
 
 ## Compaction UI
 
@@ -108,7 +114,7 @@ checkpoint user messages: 5, 6
 compression: 123.6x
 ```
 
-`context before` is Pi/provider-reported usage. The breakdown and context-after values are local estimates and are marked with `~` where appropriate.
+`context before` is Pi's current usage. The breakdown and context-after values are local estimates and are marked with `~` where appropriate. When the current assistant carries server-reported prompt usage, the context-after estimate anchors to that exact provider prefix, subtracts the estimated compacted delta, and adds the new checkpoint/current raw tail. Unseen content is never discounted below the conservative bytes/3 estimate; a second structural estimate of messages plus tool declarations is retained and the larger estimate wins.
 
 ## Configuration
 
@@ -139,7 +145,7 @@ Example:
 | `cacheRetention` | Provider cache retention: `none`, `short`, `long`; default `short`. |
 | `toolChoice` | Summary request tool choice: `none` or `auto`; default `none`. Tool declarations remain for prefix identity. |
 | `continuation` | Prefer a forward continuation of the cached conversation. Default `true`. |
-| `rewindWhenNeeded` | Permit dropped-span rewind when no continuation fits. Default `false`. |
+| `rewindWhenNeeded` | Permit a cold dropped-span rewind when no continuation fits. Default `false`; preserve recovery after an oversized `length` turn is the one automatic exception. |
 | `debug` | Master debug switch. `false` (default) disables stderr/structured debug output and never creates/touches `debugFile`. |
 | `debugFile` | Absolute JSONL path for structured diagnostics. The file is written only when `debug: true`. |
 | `debugPayloads` | Optional compact payload dumps around compaction for `compare-dumps.mjs`; conversation messages are retained, but provider tool declarations are stored as names only. |
@@ -157,7 +163,7 @@ Provider cache metrics such as `cacheRead` and `cacheWrite` are observability on
 The canonical records are:
 
 - `preserve_compaction` — one self-contained audit record per successful preserve checkpoint. It contains checkpoint number/scope, absolute covered user-message ordinals, raw branch entry IDs/boundaries, historical checkpoint IDs/hashes, the provider tool declarations captured before compaction, full predicted model-visible `contextBefore` and `contextAfter`, a per-message index (`role`, semantic kind, source session-entry ID, checkpoint number, estimated tokens, hash), complete token accounting, compression/reclaimed estimates, and a structural stable-prefix diagnostic including the first divergence.
-- `post_compaction_context` — the **actual next provider** messages/tool declarations after the checkpoint, plus an exact provider-message shared-prefix count against the previous live request and hashes of the checkpoints present in the branch.
+- `post_compaction_context` — the **actual next provider** messages/tool declarations after the checkpoint when the same Pi process continues, plus an exact provider-message shared-prefix count against the previous live request and hashes of the checkpoints present in the branch. If a `length` stop ends that process and the session is resumed later, the pending in-memory marker cannot cross the restart; the recovery E2E therefore certifies the resumed provider payload directly.
 - `provider_request`, `provider_headers`, `provider_response` — request/cache fingerprints and redacted transport diagnostics.
 - `summary_start`, `summary_result`, `summary_retry` — summary lifecycle and the deterministic retry for unusable non-error summary output.
 - `summary_provider_retry_scheduled`, `summary_provider_retry_attempt_start`, `summary_provider_retry_finished` — transient provider retry lifecycle driven by Pi's `settings.retry`.

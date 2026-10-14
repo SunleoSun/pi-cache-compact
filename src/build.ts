@@ -306,7 +306,14 @@ export function preserveReserveTokens(contextWindow: number | undefined): number
 }
 
 // reserveTokens is the only preserve-mode compaction threshold.
-export type SummaryRequestShape = "continuation" | "continuation-request" | "dropped"
+export type SummaryRequestShape =
+| "continuation"
+| "continuation-request"
+| "dropped"
+| "recovery-rewind"
+
+export const PRESERVE_RECOVERY_SYSTEM_PROMPT =
+"Summarize the supplied technical context. Follow the final user instruction exactly."
 
 // No independent automatic-summary minimum: reserveTokens is the policy.
 
@@ -389,12 +396,15 @@ export function planSummaryRequest(args: {
   modelMaxTokens?: number
   /** Absolute user-message ordinals covered by this preserve delta. */
   preserveUserMessageOrdinals?: readonly number[]
-}): SummaryRequestPlan {
+  /** Permit a cold, minimal dropped-delta request when a preserve continuation cannot fit. */
+  allowPreserveRewind?: boolean
+  }): SummaryRequestPlan {
   // Resolve the output ceiling once from the active mode's policy so every fit
   // check and the actual request use the same ceiling.
-  // One scale for every estimate in this decision, calibrated against the
-  // server's own reported prompt size where one is available.
-  const scale = tokenScale(args.liveMessages)
+  // Reported usage calibrates historical content, but it cannot prove that a new
+  // tool blob tokenizes as cheaply as that prefix. Never scale unreported bytes
+  // below the conservative bytes/3 baseline.
+  const scale = unreportedTokenScale(args.liveMessages)
   const reserveMaxTokens = summaryOutputCap({
     reserveTokens: args.reserveTokens,
     modelMaxTokens: args.modelMaxTokens,
@@ -413,20 +423,25 @@ export function planSummaryRequest(args: {
   })
   const preserveMinimumOutput = 1
   type SummaryCandidate = {
-    shape: SummaryRequestShape
-    messages: Message[]
-    reportedPrefixTokens?: number
+  shape: SummaryRequestShape
+  messages: Message[]
+  reportedPrefixTokens?: number
   }
-  const outputBudget = (candidate: SummaryCandidate): number | undefined =>
-    continuationOutputBudget({
-      contextWindow: args.contextWindow,
-      messages: candidate.messages,
-      scale,
-      ask: fitAsk,
-      ...(candidate.reportedPrefixTokens === undefined
-        ? {}
-        : { reportedPrefixTokens: candidate.reportedPrefixTokens }),
-    })
+  const outputBudget = (candidate: SummaryCandidate): number | undefined => {
+  const coldRecovery = candidate.shape === "recovery-rewind"
+  return continuationOutputBudget({
+  contextWindow: args.contextWindow,
+  messages: candidate.messages,
+  // A recovery rewind is a brand-new prompt. Historical provider calibration
+  // describes a different, much larger prefix and must not inflate this delta.
+  scale: coldRecovery ? 1 : scale,
+  ask: fitAsk,
+  ignoreReportedUsage: coldRecovery,
+  ...(candidate.reportedPrefixTokens === undefined
+  ? {}
+  : { reportedPrefixTokens: candidate.reportedPrefixTokens }),
+  })
+  }
   const fits = (candidate: SummaryCandidate): boolean => {
     if (args.options.preserveDialogue === true) {
       const budget = outputBudget(candidate)
@@ -450,17 +465,30 @@ export function planSummaryRequest(args: {
   const requiredRequestCount = Math.max(0, args.liveMessages.length - keptCount)
   const candidates: SummaryCandidate[] = []
   if (args.options.preserveDialogue === true) {
-    const usePreviousProviderPrefix =
-      args.requestMessages.length >= requiredRequestCount &&
-      args.requestMessages.length > 0 &&
-      args.requestMessages.length < args.liveMessages.length
-    candidates.push({
-      shape: usePreviousProviderPrefix ? "continuation-request" : "continuation",
-      messages: usePreviousProviderPrefix ? args.requestMessages : args.liveMessages,
-      ...(usePreviousProviderPrefix && args.requestPromptTokens !== undefined
-        ? { reportedPrefixTokens: args.requestPromptTokens }
-        : {}),
-    })
+  const usePreviousProviderPrefix =
+  args.requestMessages.length >= requiredRequestCount &&
+  args.requestMessages.length > 0 &&
+  args.requestMessages.length < args.liveMessages.length
+  candidates.push({
+  shape: usePreviousProviderPrefix ? "continuation-request" : "continuation",
+  messages: usePreviousProviderPrefix ? args.requestMessages : args.liveMessages,
+  ...(usePreviousProviderPrefix && args.requestPromptTokens !== undefined
+  ? { reportedPrefixTokens: args.requestPromptTokens }
+  : {}),
+  })
+  if (args.allowPreserveRewind === true) {
+  candidates.push({
+  shape: "recovery-rewind",
+  messages: [
+  {
+  role: "system",
+  content: PRESERVE_RECOVERY_SYSTEM_PROMPT,
+  timestamp: 0,
+  } as Message,
+  ...args.droppedMessages,
+  ],
+  })
+  }
   } else {
     if (args.options.continuation !== false) {
       if (args.liveMessages.length > droppedCount) {
@@ -625,13 +653,15 @@ export function promptTokensOf(message: unknown): number | undefined {
  * summary into a hard `exceed_context_size_error`.
  */
 const BYTES_PER_TOKEN = 3
+const UTF8_ENCODER = new TextEncoder()
 
 function byteLength(value: unknown): number {
-  try {
-    return JSON.stringify(value)?.length ?? 0
-  } catch {
-    return String(value).length
-  }
+try {
+const serialized = JSON.stringify(value)
+return serialized === undefined ? 0 : UTF8_ENCODER.encode(serialized).byteLength
+} catch {
+return UTF8_ENCODER.encode(String(value)).byteLength
+}
 }
 
 function estimatedTokens(value: unknown): number {
@@ -650,16 +680,25 @@ function estimatedTokens(value: unknown): number {
  * correction to an estimate that has to stay in the same ballpark.
  */
 export function tokenScale(messages: readonly unknown[]): number {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const reported = promptTokensOf(messages[index])
-    if (reported === undefined) continue
-    const estimated = estimateMessagesTokens(messages.slice(0, index))
-    if (estimated <= 0) continue
-    const ratio = reported / estimated
-    if (!Number.isFinite(ratio)) continue
-    return Math.min(5, Math.max(0.2, ratio))
-  }
-  return 1
+for (let index = messages.length - 1; index >= 0; index--) {
+const reported = promptTokensOf(messages[index])
+if (reported === undefined) continue
+const estimated = estimateMessagesTokens(messages.slice(0, index))
+if (estimated <= 0) continue
+const ratio = reported / estimated
+if (!Number.isFinite(ratio)) continue
+return Math.min(5, Math.max(0.2, ratio))
+}
+return 1
+}
+
+/**
+ * Scale for content the provider has never tokenized yet. Historical usage may
+ * safely calibrate upward, but a ratio below 1 is composition-specific and can
+ * badly undercount code/JSON-heavy tool results that follow a prose-heavy prefix.
+ */
+export function unreportedTokenScale(messages: readonly unknown[]): number {
+return Math.max(1, tokenScale(messages))
 }
 
 /**
@@ -705,20 +744,24 @@ function continuationOutputBudget(args: {
   reportedPrefixTokens?: number
   /** See `tokenScale`: multiplies the estimated (not the reported) part. */
   scale?: number
-}): number | undefined {
+  /** Cold prompts must not reuse usage metadata captured on messages in another request. */
+  ignoreReportedUsage?: boolean
+  }): number | undefined {
   // An unknown window cannot be checked; leave the caller's output ceiling alone.
   if (typeof args.contextWindow !== "number" || !Number.isFinite(args.contextWindow))
     return undefined
 
   let reported = 0
   let reportedIndex = -1
+  if (args.ignoreReportedUsage !== true) {
   for (let index = args.messages.length - 1; index >= 0; index--) {
-    const tokens = promptTokensOf(args.messages[index])
-    if (tokens !== undefined) {
-      reported = tokens
-      reportedIndex = index
-      break
-    }
+  const tokens = promptTokensOf(args.messages[index])
+  if (tokens !== undefined) {
+  reported = tokens
+  reportedIndex = index
+  break
+  }
+  }
   }
 
   const scale = args.scale && args.scale > 0 ? args.scale : 1

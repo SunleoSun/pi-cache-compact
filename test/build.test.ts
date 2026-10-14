@@ -9,6 +9,7 @@ import {
   continuationFits,
   extractLiveReasoningEffort,
   extractSummaryText,
+  estimateMessagesTokens,
   formatFileOperations,
   isModelAllowed,
   PI_TURN_PREFIX_FORMAT,
@@ -17,10 +18,12 @@ import {
   preserveSummaryOrdinalRejection,
   summaryOutputCap,
   tokenScale,
+  unreportedTokenScale,
   looksLikeToolCall,
   messageSnippet,
   messagesBeforeEntry,
   planSummaryRequest,
+  PRESERVE_RECOVERY_SYSTEM_PROMPT,
   promptTokensOf,
   renderSummaryAsk,
   replayableHeaders,
@@ -523,6 +526,57 @@ test("preserve planning trusts the exact previous provider-prefix token count", 
   assert.deepEqual(plan.messages, prefix)
 })
 
+test("preserve recovery rewind ignores stale usage from the original live prefix", () => {
+const rawDelta: any[] = [
+{
+role: "assistant",
+content: [{ type: "toolCall", id: "call_2", name: "read", arguments: { path: "probe.txt" } }],
+usage: { input: 37_000, cacheRead: 0, cacheWrite: 0 },
+stopReason: "toolUse",
+},
+{
+role: "toolResult",
+toolCallId: "call_2",
+toolName: "read",
+content: [{ type: "text", text: "RECOVERY TOOL OUTPUT\n" + "r".repeat(40_000) }],
+},
+]
+const liveMessages: any[] = [
+{ role: "system", content: "FULL LIVE SYSTEM" },
+{ role: "user", content: "PERMANENT DIALOGUE" },
+...rawDelta,
+{
+role: "assistant",
+content: [{ type: "text", text: "I" }],
+usage: { input: 56_172, cacheRead: 0, cacheWrite: 0 },
+stopReason: "length",
+},
+]
+const requestMessages = liveMessages.slice(0, -1)
+const plan = planSummaryRequest({
+liveMessages,
+requestMessages,
+requestPromptTokens: 56_172,
+droppedMessages: rawDelta,
+keptCount: 1,
+options: { preserveDialogue: true },
+contextWindow: 50_000,
+reserveTokens: preserveReserveTokens(50_000),
+modelMaxTokens: 512,
+preserveUserMessageOrdinals: [2],
+allowPreserveRewind: true,
+})
+
+assert.equal(plan.shape, "recovery-rewind")
+assert.equal(plan.requestFits, true)
+assert.ok(plan.maxTokens > 0)
+assert.equal(plan.messages[0].role, "system")
+assert.equal((plan.messages[0] as any).content, PRESERVE_RECOVERY_SYSTEM_PROMPT)
+assert.equal(plan.messages.length, rawDelta.length + 1)
+assert.ok(JSON.stringify(plan.messages).includes("RECOVERY TOOL OUTPUT"))
+assert.ok(!JSON.stringify(plan.messages).includes("PERMANENT DIALOGUE"))
+})
+
 test("planSummaryRequest continues the last live request when the projection is too big", () => {
   // The production case: a 100 KB tool result arrives after the last request, so
   // the whole projection no longer fits the window — but the request the server
@@ -851,7 +905,27 @@ test("tokenScale calibrates byte estimates against the server's own count", () =
 
   // No reported usage anywhere: no correction, and no throw.
   assert.equal(tokenScale([{ role: "user", content: "hello" }] as any), 1)
-})
+  })
+
+  test("token estimation counts UTF-8 bytes rather than JavaScript code units", () => {
+  const ascii = estimateMessagesTokens([{ role: "user", content: "e".repeat(1_000) }])
+  const unicode = estimateMessagesTokens([{ role: "user", content: "é".repeat(1_000) }])
+  assert.ok(unicode > ascii)
+  })
+
+  test("unreportedTokenScale never discounts unseen content below bytes/3", () => {
+  const blob = "x".repeat(30_000)
+  const calibrated = [
+  { role: "user", content: blob },
+  {
+  role: "assistant",
+  content: [{ type: "text", text: "ok" }],
+  usage: { input: 100, cacheRead: 0, cacheWrite: 0 },
+  },
+  ]
+  assert.equal(tokenScale(calibrated as any), 0.2)
+  assert.equal(unreportedTokenScale(calibrated as any), 1)
+  })
 
 test("calibration changes what fits", () => {
   // The content *after* the reported message is the part we have to estimate,

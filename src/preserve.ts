@@ -194,24 +194,28 @@ function entryMessages(entry: SessionEntry, edit: ContextEditEntry | undefined):
     )
 }
 
+export function isPreservedAssistantReply(
+message: AgentMessage,
+): message is Extract<AgentMessage, { role: "assistant" }> {
+if (message.role !== "assistant" || message.stopReason !== "stop") return false
+if (!Array.isArray(message.content)) return false
+if (message.content.some((block) => block.type === "toolCall")) return false
+return message.content.some((block) => block.type === "text")
+}
+
 function preservedDialogueMessage(
-  entry: SessionEntry,
-  edit: ContextEditEntry | undefined,
+entry: SessionEntry,
+edit: ContextEditEntry | undefined,
 ): AgentMessage | undefined {
-  if (entry.type !== "message") return undefined
-  const edited = applyEdit(entry.message, edit)
-  if (!edited) return undefined
+if (entry.type !== "message") return undefined
+const edited = applyEdit(entry.message, edit)
+if (!edited) return undefined
 
-  if (edited.role === "user") return edited
-  if (edited.role !== "assistant") return undefined
-  if (edited.stopReason !== "stop") return undefined
-  if (!Array.isArray(edited.content)) return undefined
-  if (edited.content.some((block) => block.type === "toolCall")) return undefined
+if (edited.role === "user") return edited
+if (!isPreservedAssistantReply(edited)) return undefined
 
-  const content = edited.content.filter((block) => block.type === "text")
-  if (content.length === 0) return undefined
-
-  return { ...edited, content } as AgentMessage
+const content = edited.content.filter((block) => block.type === "text")
+return { ...edited, content } as AgentMessage
 }
 
 function preservedContextDialogueMessage(
