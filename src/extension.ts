@@ -183,6 +183,7 @@ type CompactionReportBase = {
   context: {
     before: number
     afterEstimated: number
+    rawTailKept?: number
   }
   compacted: {
     total: number
@@ -257,6 +258,7 @@ export function formatCompactionReport(report: CompactionReport, expanded: boole
       formatReportTokens(report.context.afterEstimated) +
       " tok",
     "compacted: ~" + formatReportTokens(report.compacted.total) + " tok",
+    "raw tail kept: ~" + formatReportTokens(report.context.rawTailKept ?? 0) + " tok",
     "compression: " + compression,
     "",
     "checkpoints total: ~" + formatReportTokens(report.checkpoints.total) + " tok",
@@ -1052,7 +1054,7 @@ const optionsFor = (ctx: ExtensionContext): CacheCompactOptions => {
       version: 1,
       trigger: pending.branch ?? fallbackBranch,
       checkpointNumber: pending.scope.nextCheckpointNumber,
-      context: { before: tokensBefore, afterEstimated },
+      context: { before: tokensBefore, afterEstimated, rawTailKept: remainingRawCalibrated },
       compacted: {
         total: compactedRawCalibrated,
         toolCalls,

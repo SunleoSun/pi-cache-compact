@@ -44,7 +44,7 @@ test("CompactionReport renders standalone summary and supplemental stats from th
     version: 1 as const,
     trigger: "manual" as const,
     checkpointNumber: 2,
-    context: { before: 29_797, afterEstimated: 7_598 },
+    context: { before: 29_797, afterEstimated: 7_598, rawTailKept: 8_565 },
     compacted: {
       total: 23_565,
       toolCalls: 1_545,
@@ -80,6 +80,7 @@ test("CompactionReport renders standalone summary and supplemental stats from th
     "manual #2 · 29,797 → ~7,598 tok · compacted ~23,565 tok · 139.4x",
   )
   const expanded = formatCompactionReport(supplemental, true)
+  assert.match(expanded, /raw tail kept: ~8,565 tok/)
   assert.match(expanded, /checkpoints total: ~397 tok/)
   assert.match(expanded, /checkpoint #1: ~228 tok/)
   assert.match(expanded, /checkpoint #2: ~169 tok \(new\)/)
@@ -1261,6 +1262,7 @@ test("preserveDialogue reports reserve-threshold compaction and keeps the newest
     assert.equal(reportEntry.data.mode, "standalone")
     assert.equal(reportEntry.data.context.before, 87_026)
     assert.ok(reportEntry.data.context.afterEstimated > 0)
+    assert.ok(reportEntry.data.context.rawTailKept > 0)
     assert.ok(reportEntry.data.compacted.total > 0)
     assert.ok(reportEntry.data.checkpoints.items.at(-1).isNew)
     assert.equal(calls.compact.length, 0)
@@ -1274,6 +1276,7 @@ test("preserveDialogue reports reserve-threshold compaction and keeps the newest
     assert.match(renderedReport, /compacted content:/)
     assert.match(renderedReport, /base context:/)
     const persistentReport = formatPersistentCompactionReport(reportEntry.data)
+    assert.match(persistentReport, /raw tail kept: ~[0-9,]+ tok/)
     assert.match(persistentReport, /checkpoints total: ~[0-9,]+ tok/)
     assert.match(persistentReport, /tools\/results summary:/)
     assert.match(persistentReport, /MOCK SUMMARY/)
@@ -1469,9 +1472,11 @@ test("manual compact always runs the preserve-dialogue checkpoint path", async (
     assert.equal("summary" in reportEntry.data, false)
     assert.equal(reportEntry.data.context.before, 20_000)
     assert.ok(reportEntry.data.context.afterEstimated > 0)
+    assert.equal(reportEntry.data.context.rawTailKept, 0)
     assert.ok(reportEntry.data.compacted.total > 0)
     assert.equal(calls.entryRenderers.has("cache-compact-report-v1"), true)
     const persistentReport = formatPersistentCompactionReport(reportEntry.data)
+    assert.match(persistentReport, /raw tail kept: ~[0-9,]+ tok/)
     assert.match(persistentReport, /checkpoints total: ~[0-9,]+ tok/)
     assert.match(persistentReport, /compacted content:/)
     assert.match(persistentReport, /base context:/)

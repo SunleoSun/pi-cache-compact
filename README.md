@@ -89,34 +89,42 @@ After recovery, the certifications inspect actual provider payloads. They verify
 
 ## Compaction UI
 
-A successful preserve checkpoint reports the trigger and token accounting, for example:
+Every successful preserve compaction persists a typed `cache-compact-report-v1` session entry that is UI-only and never enters model context. Persistent reports always render their full body; they do not collapse with Pi's global expanded-output flag.
+
+Automatic compaction uses a standalone report: full token accounting plus the new checkpoint summary.
 
 ```text
-[cache-compact] compact complete: reserve threshold
-context before (Pi usage): 35562 tok
-context after: ~... tok (provider-calibrated estimate)
-compacted raw: ~... tok
+[cache-compact]
 
-preserved dialogue: ~2080 tok
-  user messages: ~1220 tok
-  assistant text: ~860 tok
-historical checkpoints: ~310 tok (1)
-raw technical before: ~27192 tok
-  older raw compacted: ~22000 tok
-  newest raw kept: ~5192 tok
-  tool calls: ~...
-  tool results: ~...
-  reasoning: ~...
-  other: ~...
-new checkpoint #2: ~220 tok
-system prompt: ~4100 tok
-tool declarations: ~1650 tok
-other provider overhead: ~540 tok
-checkpoint user messages: 5, 6
-compression: 123.6x
+44,807 → ~15,693 tok
+compacted: ~29,319 tok
+raw tail kept: ~8,754 tok
+compression: 178.8x
+
+checkpoints total: ~164 tok
+ checkpoint #1: ~164 tok (new)
+
+compacted content:
+ tool calls: ~1,341 tok
+ tool results: ~24,633 tok
+ reasoning: ~3,345 tok
+
+base context:
+ system prompt: ~5,655 tok
+ tool declarations: ~1,093 tok
+
+covered user messages: 1
+
+tools/results summary:
+
+## Tool Context
+### User message 1
+...
 ```
 
-`context before (Pi usage)` is Pi's current context usage at the boundary; it can include locally estimated newly appended tail state, so it is not always an exact provider token count. `context after` and every token count in the displayed breakdown use the same provider-calibrated scale. The UI takes the larger of its calibrated structural and reported-prefix-anchored estimates; conservative bytes/3 accounting remains internal for fit/safety decisions and structured debug audits.
+Manual `/compact` keeps Pi's native `[compaction]` card as the summary owner and persists a supplemental cache-compact report containing statistics only. This avoids displaying the summary twice while still keeping the complete accounting visible after TUI rebuild/reload.
+
+`context before` is Pi's current context usage at the boundary; it can include locally estimated newly appended tail state, so it is not always an exact provider token count. `context after` and every token count in the displayed breakdown use the same provider-calibrated scale. `raw tail kept` is the calibrated technical state deliberately retained after the checkpoint and is shown directly after `compacted`. The UI takes the larger of its calibrated structural and reported-prefix-anchored after estimates; conservative UTF-8 bytes/3 accounting remains internal for fit/safety decisions and structured debug audits.
 
 ## Configuration
 
@@ -158,14 +166,14 @@ Summary provider failures use Pi's effective `settings.retry` policy before comp
 
 ## Debugging and observability
 
-`debugFile` is written only when `debug: true` and a path is configured; `debug: false` never creates or touches it. It is a **rolling JSONL file with a hard 1 MiB limit**. Before appending a record that would exceed the limit, the logger evicts the oldest complete JSONL records. If one record alone is larger than 1 MiB, it is replaced by a small `log_record_oversize` marker. The logger never throws into the compaction path. In interactive Pi TUI sessions debug diagnostics are not written directly to stderr, because asynchronous stderr output corrupts the composer area; user-facing compaction status goes through Pi notifications while structured diagnostics stay in JSONL. The extension itself performs no other runtime filesystem writes; Pi still persists its own normal session/transcript files.
+`debugFile` is written only when `debug: true` and a path is configured; `debug: false` never creates or touches it. It is a **rolling JSONL file with a hard 1 MiB limit**. Before appending a record that would exceed the limit, the logger evicts the oldest complete JSONL records. If one record alone is larger than 1 MiB, it is replaced by a small `log_record_oversize` marker. The logger never throws into the compaction path. In interactive Pi TUI sessions debug diagnostics are not written directly to stderr, because asynchronous stderr output corrupts the composer area. Successful compactions are persisted as `cache-compact-report-v1` UI entries; Pi notifications are reserved for transient retry/warning/failure status, while structured diagnostics stay in JSONL. The extension itself performs no other runtime filesystem writes; Pi still persists its own normal session/transcript files.
 
 Provider usage/cache metrics are observability only. Live input/output/reasoning counts, cache read/write counts, and stop reason are added to the existing `dynamic_compaction_pressure` record, so this costs only a few scalar fields per turn instead of another record. They never reshape compaction behavior.
 
 The canonical records are:
 
 - `preserve_compaction` — one self-contained structural audit record per successful preserve checkpoint. It contains checkpoint number/scope, absolute covered user-message ordinals, raw branch entry IDs/boundaries, historical checkpoint IDs/hashes, provider tool names, a per-message index (`role`, semantic kind, source session-entry ID, checkpoint number, estimated tokens, hash), complete token accounting, compression/compacted estimates, and stable-prefix divergence diagnostics. With ordinary `debug: true`, full `contextBefore`/`contextAfter` message bodies are omitted; they are included only in forensic `debugPayloads: true` mode.
-- `post_compaction_context` — the **actual next provider** structural message index and tool names after the checkpoint, plus exact provider-message shared-prefix counts against the previous live request and hashes of checkpoints present in the branch. It deliberately does not duplicate conversation text. If a `length` stop ends that process and the session is resumed later, the pending in-memory marker cannot cross the restart; the recovery E2E therefore certifies the resumed provider payload directly.
+- `post_compaction_context` — the **actual next provider** structural message index and tool names after the checkpoint, plus exact provider-message shared-prefix counts against the previous live request and hashes of checkpoints present in the branch. Provider payload normalization understands both message-array requests and Codex/Responses `instructions + input`, so the message index is populated for either shape. It deliberately does not duplicate conversation text. If a `length` stop ends that process and the session is resumed later, the pending in-memory marker cannot cross the restart; the recovery E2E therefore certifies the resumed provider payload directly.
 - `provider_request`, `provider_headers`, `provider_response` — request/cache fingerprints and redacted transport diagnostics.
 - `summary_start`, `summary_result`, `summary_retry` — summary lifecycle and the deterministic retry for unusable non-error summary output.
 - `summary_provider_retry_scheduled`, `summary_provider_retry_attempt_start`, `summary_provider_retry_finished` — transient provider retry lifecycle driven by Pi's `settings.retry`.
