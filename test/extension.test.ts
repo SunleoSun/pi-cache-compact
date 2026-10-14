@@ -13,12 +13,14 @@ import type {
 } from "@earendil-works/pi-coding-agent"
 import type { AssistantMessage } from "@earendil-works/pi-ai"
 
-import cacheCompact from "../src/extension.ts"
+import cacheCompact, { formatCompactionReport, formatPersistentCompactionReport, type CompactionReport } from "../src/extension.ts"
 
 type Calls = {
-  complete: Array<{ model: any; context: any; options: any }>
-  compact: any[]
-  notifications: Array<{ message: string; type: string | undefined }>
+complete: Array<{ model: any; context: any; options: any }>
+compact: any[]
+notifications: Array<{ message: string; type: string | undefined }>
+appendedEntries: Array<{ customType: string; data: any }>
+entryRenderers: Map<string, Function>
 }
 
 function assistant(
@@ -36,6 +38,57 @@ function assistant(
     timestamp: Date.now(),
   }
 }
+
+test("CompactionReport renders standalone summary and supplemental stats from the same contract", () => {
+  const base = {
+    version: 1 as const,
+    trigger: "manual" as const,
+    checkpointNumber: 2,
+    context: { before: 29_797, afterEstimated: 7_598 },
+    compacted: {
+      total: 23_565,
+      toolCalls: 1_545,
+      toolResults: 16_502,
+      reasoning: 5_518,
+      other: 0,
+    },
+    checkpoints: {
+      total: 397,
+      items: [
+        { number: 1, tokens: 228, isNew: false },
+        { number: 2, tokens: 169, isNew: true },
+      ],
+    },
+    baseContext: {
+      systemPrompt: 5_710,
+      toolDeclarations: 1_103,
+      otherProviderOverhead: 0,
+    },
+    compression: 139.4,
+    coveredUserMessages: [2],
+  }
+  const supplemental: CompactionReport = { ...base, mode: "supplemental" }
+  const standalone: CompactionReport = {
+    ...base,
+    trigger: "reserve threshold",
+    mode: "standalone",
+    summary: "SUMMARY BODY",
+  }
+
+  assert.equal(
+    formatCompactionReport(supplemental, false),
+    "manual #2 · 29,797 → ~7,598 tok · compacted ~23,565 tok · 139.4x",
+  )
+  const expanded = formatCompactionReport(supplemental, true)
+  assert.match(expanded, /checkpoints total: ~397 tok/)
+  assert.match(expanded, /checkpoint #1: ~228 tok/)
+  assert.match(expanded, /checkpoint #2: ~169 tok \(new\)/)
+  assert.match(expanded, /compacted content:/)
+  assert.match(expanded, /base context:/)
+  assert.match(expanded, /covered user messages: 2/)
+  assert.doesNotMatch(expanded, /tools\/results summary:/)
+  assert.match(formatCompactionReport(standalone, true), /tools\/results summary:\n\nSUMMARY BODY/)
+})
 
 function setup(config?: {
   response?: AssistantMessage | (() => Promise<AssistantMessage>)
@@ -55,7 +108,13 @@ function setup(config?: {
   agentDir?: string
 }) {
   const handlers = new Map<string, Function>()
-  const calls: Calls = { complete: [], compact: [], notifications: [] }
+  const calls: Calls = {
+    complete: [],
+    compact: [],
+    notifications: [],
+    appendedEntries: [],
+    entryRenderers: new Map(),
+  }
   const api = {
     on: (event: string, handler: Function) => {
       handlers.set(event, handler)
@@ -66,6 +125,12 @@ function setup(config?: {
         { name: "read", description: "read", parameters: { type: "object" }, sourceInfo: {} },
       ],
     getActiveTools: () => config?.activeTools ?? ["read"],
+    registerEntryRenderer: (customType: string, renderer: Function) => {
+      calls.entryRenderers.set(customType, renderer)
+    },
+    appendEntry: (customType: string, data: any) => {
+      calls.appendedEntries.push({ customType, data })
+    },
   } as unknown as ExtensionAPI
 
   const respond = async (): Promise<AssistantMessage> => {
@@ -378,8 +443,11 @@ test("preserveDialogue compacts older tool state when the newest tool batch ente
       ),
       false,
     )
-    const checkpoint = result.entries.at(-1)
-    assert.equal(checkpoint.customType, "cache-compact-preserve-checkpoint")
+    const checkpoint = result.entries.find(
+      (entry: any) =>
+        entry.type === "custom_message" && entry.customType === "cache-compact-preserve-checkpoint",
+    )
+    assert.ok(checkpoint)
     const summaryRequest = JSON.stringify(calls.complete[0].context.messages)
     assert.match(summaryRequest, /OLD TOOL OUTPUT/)
     assert.doesNotMatch(summaryRequest, /LATEST TOOL OUTPUT/)
@@ -466,7 +534,19 @@ test("certification: a latest tool batch crossing the fitted 50k reserve trigger
       result.entries.some((entry: any) => entry.type === "compaction"),
       false,
     )
-    assert.equal(result.entries.at(-1).customType, "cache-compact-preserve-checkpoint")
+    const checkpoint = result.entries.find(
+      (entry: any) =>
+        entry.type === "custom_message" && entry.customType === "cache-compact-preserve-checkpoint",
+    )
+    const reportEntry = result.entries.find(
+      (entry: any) => entry.type === "custom" && entry.customType === "cache-compact-report-v1",
+    )
+    assert.ok(checkpoint)
+    assert.ok(reportEntry)
+    assert.equal(reportEntry.data.mode, "standalone")
+    assert.equal(reportEntry.data.trigger, "reserve threshold")
+    assert.equal(reportEntry.data.summary, "MOCK SUMMARY")
+    assert.equal(reportEntry.data.checkpointNumber, 1)
     assert.match(calls.notifications.at(-1)!.message, /reserve threshold/)
     assert.ok(calls.complete[0].options.maxTokens > 0)
     assert.ok(calls.complete[0].options.maxTokens <= 8_886)
@@ -551,7 +631,19 @@ test("certification: a 500k preserve window uses the fitted 29,575-token reserve
     assert.equal(calls.complete.length, 1)
     assert.ok(calls.complete[0].options.maxTokens > 0)
     assert.ok(calls.complete[0].options.maxTokens <= 29_575)
-    assert.equal(result.entries.at(-1).customType, "cache-compact-preserve-checkpoint")
+    const checkpoint = result.entries.find(
+      (entry: any) =>
+        entry.type === "custom_message" && entry.customType === "cache-compact-preserve-checkpoint",
+    )
+    const reportEntry = result.entries.find(
+      (entry: any) => entry.type === "custom" && entry.customType === "cache-compact-report-v1",
+    )
+    assert.ok(checkpoint)
+    assert.ok(reportEntry)
+    assert.equal(reportEntry.data.mode, "standalone")
+    assert.equal(reportEntry.data.trigger, "reserve threshold")
+    assert.equal(reportEntry.data.summary, "MOCK SUMMARY")
+    assert.equal(reportEntry.data.checkpointNumber, 1)
     assert.ok(calls.notifications.some((notice) => /reserve threshold/.test(notice.message)))
   } finally {
     ws.cleanup()
@@ -724,11 +816,22 @@ result.entries.some(
 ),
 false,
 )
-assert.equal(result.entries.at(-1).customType, "cache-compact-preserve-checkpoint")
-assert.match(
-calls.notifications.find((notice) => /compact complete/.test(notice.message))!.message,
- /newest raw kept: ~[1-9]\d* tok/,
+const checkpoint = result.entries.find(
+  (entry: any) =>
+    entry.type === "custom_message" && entry.customType === "cache-compact-preserve-checkpoint",
 )
+const reportEntry = result.entries.find(
+  (entry: any) => entry.type === "custom" && entry.customType === "cache-compact-report-v1",
+)
+assert.ok(checkpoint)
+assert.ok(reportEntry)
+assert.equal(reportEntry.data.mode, "standalone")
+assert.equal(reportEntry.data.trigger, "reserve threshold")
+assert.equal(reportEntry.data.summary, "RECOVERED SUMMARY")
+assert.equal(reportEntry.data.checkpointNumber, 1)
+const renderedReport = formatCompactionReport(reportEntry.data, true)
+assert.match(renderedReport, /compacted: ~[1-9][0-9,]* tok/)
+assert.match(renderedReport, /base context:/)
 } finally {
 ws.cleanup()
 }
@@ -998,10 +1101,11 @@ calls.notifications.some((notice) =>
 /technical delta is too large for one summary/.test(notice.message),
 ),
 )
-    const completeNotice = calls.notifications.find((notice) =>
-      notice.message.includes("compact complete: reserve threshold"),
+    const reportEntry = result.entries.find(
+      (entry: any) => entry.type === "custom" && entry.customType === "cache-compact-report-v1",
     )
-    assert.ok(completeNotice)
+    assert.ok(reportEntry)
+    assert.equal(reportEntry.data.mode, "standalone")
     const audit = readRecords(debugFile).find((record) => record.kind === "preserve_compaction")
     assert.ok(audit)
     assert.ok(audit.tokens.tailAfterPrefix < audit.tokens.remainingRawCompactable)
@@ -1022,8 +1126,11 @@ calls.notifications.some((notice) =>
         audit.tokens.newCheckpointCalibrated +
         audit.tokens.tailAfterPrefixCalibrated,
     )
-    const checkpoint = result.entries.at(-1)
-assert.equal(checkpoint.customType, "cache-compact-preserve-checkpoint")
+    const checkpoint = result.entries.find(
+      (entry: any) =>
+        entry.type === "custom_message" && entry.customType === "cache-compact-preserve-checkpoint",
+    )
+    assert.ok(checkpoint)
 assert.equal(checkpoint.details.checkpoint.rawTailStartEntryId, "a-second")
 assert.ok(
 result.entries.some(
@@ -1142,21 +1249,34 @@ test("preserveDialogue reports reserve-threshold compaction and keeps the newest
       ctx,
     )
 
-    assert.equal(result.entries.at(-1).type, "custom_message")
+    const checkpoint = result.entries.find(
+      (entry: any) =>
+        entry.type === "custom_message" && entry.customType === "cache-compact-preserve-checkpoint",
+    )
+    const reportEntry = result.entries.find(
+      (entry: any) => entry.type === "custom" && entry.customType === "cache-compact-report-v1",
+    )
+    assert.ok(checkpoint)
+    assert.ok(reportEntry)
+    assert.equal(reportEntry.data.mode, "standalone")
+    assert.equal(reportEntry.data.context.before, 87_026)
+    assert.ok(reportEntry.data.context.afterEstimated > 0)
+    assert.ok(reportEntry.data.compacted.total > 0)
+    assert.ok(reportEntry.data.checkpoints.items.at(-1).isNew)
     assert.equal(calls.compact.length, 0)
     assert.equal(calls.complete.length, 1)
     const summaryRequestText = JSON.stringify(calls.complete[0].context.messages)
     assert.match(summaryRequestText, /OLD COMPACTABLE RESULT/)
     assert.doesNotMatch(summaryRequestText, /LATEST RAW RESULT/)
-    const completeNotice = calls.notifications.find((notice) =>
-      /compact complete: reserve threshold/.test(notice.message),
-    )
-    assert.ok(completeNotice)
-    assert.match(completeNotice.message, /context before \(Pi usage\): 87026 tok/)
-    assert.match(completeNotice.message, /context after: ~\d+ tok \(provider-calibrated estimate\)/)
-    assert.equal(completeNotice.message.includes("conservative"), false)
-    assert.match(completeNotice.message, /older raw compacted: ~[1-9]\d* tok/)
-    assert.match(completeNotice.message, /newest raw kept: ~[1-9]\d* tok/)
+    const renderedReport = formatCompactionReport(reportEntry.data, true)
+    assert.match(renderedReport, /87,026 → ~[0-9,]+ tok/)
+    assert.match(renderedReport, /checkpoints total: ~[0-9,]+ tok/)
+    assert.match(renderedReport, /compacted content:/)
+    assert.match(renderedReport, /base context:/)
+    const persistentReport = formatPersistentCompactionReport(reportEntry.data)
+    assert.match(persistentReport, /checkpoints total: ~[0-9,]+ tok/)
+    assert.match(persistentReport, /tools\/results summary:/)
+    assert.match(persistentReport, /MOCK SUMMARY/)
     const pressure = readRecords(debugFile).find(
       (record) => record.kind === "dynamic_compaction_pressure",
     )
@@ -1310,6 +1430,7 @@ test("manual compact always runs the preserve-dialogue checkpoint path", async (
 
     assert.equal(result?.cancel, undefined)
     assert.match(result.compaction.summary, /^MOCK SUMMARY/)
+    assert.equal(result.compaction.firstKeptEntryId, "u1")
     assert.equal(calls.complete.length, 1)
     assert.deepEqual(result.compaction.details.checkpoint, {
     summary: result.compaction.summary,
@@ -1339,7 +1460,26 @@ test("manual compact always runs the preserve-dialogue checkpoint path", async (
       } as any,
       ctx,
     )
-    assert.ok(calls.notifications.some((notice) => /compact complete: manual/.test(notice.message)))
+    assert.equal(calls.appendedEntries.length, 1)
+    const reportEntry = calls.appendedEntries[0]
+    assert.equal(reportEntry.customType, "cache-compact-report-v1")
+    assert.equal(reportEntry.data.mode, "supplemental")
+    assert.equal(reportEntry.data.trigger, "manual")
+    assert.equal(reportEntry.data.checkpointNumber, 1)
+    assert.equal("summary" in reportEntry.data, false)
+    assert.equal(reportEntry.data.context.before, 20_000)
+    assert.ok(reportEntry.data.context.afterEstimated > 0)
+    assert.ok(reportEntry.data.compacted.total > 0)
+    assert.equal(calls.entryRenderers.has("cache-compact-report-v1"), true)
+    const persistentReport = formatPersistentCompactionReport(reportEntry.data)
+    assert.match(persistentReport, /checkpoints total: ~[0-9,]+ tok/)
+    assert.match(persistentReport, /compacted content:/)
+    assert.match(persistentReport, /base context:/)
+    assert.doesNotMatch(persistentReport, /tools\/results summary:/)
+    assert.equal(
+      calls.notifications.some((notice) => /compact complete: manual/.test(notice.message)),
+      false,
+    )
   } finally {
     ws.cleanup()
   }
@@ -1496,6 +1636,7 @@ test("a later preserveDialogue compaction summarizes the same restored dialogue 
         firstKeptEntryId: "keep-1",
         tokensBefore: 900,
         details: { cacheCompact: { mode: "preserve-dialogue-v1", version: 1 } },
+        systemMessage: { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
       },
       {
         type: "message",
@@ -1549,6 +1690,7 @@ test("a later preserveDialogue compaction summarizes the same restored dialogue 
 
     const summaryContext = calls.complete[0].context.messages
     const serialized = JSON.stringify(summaryContext)
+    assert.equal(summaryContext.filter((message: any) => message.role === "system").length, 1)
     assert.ok(serialized.includes("EXACT OLD PROMPT"))
     assert.ok(serialized.includes("EXACT OLD RESPONSE"))
     assert.ok(serialized.includes("old tool state"))
@@ -2101,10 +2243,8 @@ test("debug records the compaction lifecycle to debugFile", async () => {
         type: "before_provider_request",
         payload: {
           model: "m",
-          messages: [
-            { role: "system", content: "SYSTEM PROMPT" },
-            { role: "user", content: "hello from the session" },
-          ],
+          instructions: "SYSTEM PROMPT",
+          input: [{ role: "user", content: "hello from the session" }],
         },
       },
       ctx,
@@ -2121,8 +2261,8 @@ test("debug records the compaction lifecycle to debugFile", async () => {
         type: "before_provider_request",
         payload: {
           model: "m",
-          messages: [
-            { role: "system", content: "SYSTEM PROMPT" },
+          instructions: "SYSTEM PROMPT",
+          input: [
             { role: "user", content: "hello from the session" },
             { role: "user", content: "after checkpoint" },
           ],

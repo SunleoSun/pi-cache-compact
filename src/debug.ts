@@ -116,6 +116,18 @@ function messageText(message: unknown): string {
   return ""
 }
 
+export function providerPayloadMessages(payload: unknown): unknown[] {
+  const body =
+    payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : {}
+  if (Array.isArray(body.messages)) return body.messages
+  if (!Array.isArray(body.input)) return []
+  return typeof body.instructions === "string" && body.instructions.length > 0
+    ? [{ role: "system", content: body.instructions }, ...body.input]
+    : body.input
+}
+
 export function fingerprintPayload(payload: unknown): Record<string, unknown> {
   let body: Record<string, unknown> = {}
   try {
@@ -123,7 +135,7 @@ export function fingerprintPayload(payload: unknown): Record<string, unknown> {
   } catch {
     /* keep {} */
   }
-  const messages = Array.isArray(body.messages) ? body.messages : []
+  const messages = providerPayloadMessages(body)
   const tools = Array.isArray(body.tools) ? body.tools : []
   const rolling = rollingMessageHashes(messages)
   const last = messages[messages.length - 1] as { role?: unknown } | undefined

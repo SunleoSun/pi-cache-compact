@@ -23,6 +23,7 @@ import { join, resolve } from "node:path"
 import {
   CONFIG_DIR_NAME,
   DEFAULT_COMPACTION_SETTINGS,
+  CustomMessageComponent,
   SettingsManager,
   convertToLlm,
   getAgentDir,
@@ -74,6 +75,7 @@ import {
   DebugLogger,
   compactPayloadForLog,
   fingerprintPayload,
+  providerPayloadMessages,
   providerToolNames,
   redactHeaders,
   rollingMessageHashes,
@@ -157,7 +159,154 @@ function effectiveAgentMessages(
     : [...projectedAgent]
 }
 
+function firstTranscriptEntryId(branchEntries: readonly SessionEntry[]): string | undefined {
+  return branchEntries.find(
+    (entry) => entry.type === "message" && entry.message.role !== "system",
+  )?.id
+}
+
 type CompactionBranch = "reserve threshold" | "manual"
+type CompactionReportMode = "standalone" | "supplemental"
+
+const COMPACTION_REPORT_TYPE = "cache-compact-report-v1"
+
+type CompactionReportCheckpoint = {
+  number: number
+  tokens: number
+  isNew: boolean
+}
+
+type CompactionReportBase = {
+  version: 1
+  trigger: CompactionBranch
+  checkpointNumber: number
+  context: {
+    before: number
+    afterEstimated: number
+  }
+  compacted: {
+    total: number
+    toolCalls: number
+    toolResults: number
+    reasoning: number
+    other: number
+  }
+  checkpoints: {
+    total: number
+    items: CompactionReportCheckpoint[]
+  }
+  baseContext: {
+    systemPrompt: number
+    toolDeclarations: number
+    otherProviderOverhead: number
+  }
+  compression: number | null
+  coveredUserMessages: number[]
+}
+
+export type CompactionReport = CompactionReportBase &
+  (
+    | { mode: "standalone"; summary: string }
+    | { mode: "supplemental"; summary?: never }
+  )
+
+function isCompactionReport(value: unknown): value is CompactionReport {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const report = value as Partial<CompactionReportBase> & { mode?: unknown; summary?: unknown }
+  return (
+    report.version === 1 &&
+    (report.mode === "standalone" || report.mode === "supplemental") &&
+    typeof report.checkpointNumber === "number" &&
+    report.context !== undefined &&
+    report.compacted !== undefined &&
+    report.checkpoints !== undefined &&
+    Array.isArray(report.checkpoints.items) &&
+    report.baseContext !== undefined &&
+    Array.isArray(report.coveredUserMessages) &&
+    (report.mode !== "standalone" || typeof report.summary === "string")
+  )
+}
+
+function formatReportTokens(tokens: number): string {
+  return Math.max(0, Math.round(tokens)).toLocaleString("en-US")
+}
+
+export function formatCompactionReport(report: CompactionReport, expanded: boolean): string {
+  const trigger = report.trigger === "manual" ? "manual" : "auto"
+  const compression =
+    report.compression === null || !Number.isFinite(report.compression)
+      ? "∞"
+      : report.compression.toFixed(1) + "x"
+  const headline =
+    trigger +
+    " #" +
+    report.checkpointNumber +
+    " · " +
+    formatReportTokens(report.context.before) +
+    " → ~" +
+    formatReportTokens(report.context.afterEstimated) +
+    " tok · compacted ~" +
+    formatReportTokens(report.compacted.total) +
+    " tok · " +
+    compression
+  if (!expanded) return headline
+
+  const lines = [
+    formatReportTokens(report.context.before) +
+      " → ~" +
+      formatReportTokens(report.context.afterEstimated) +
+      " tok",
+    "compacted: ~" + formatReportTokens(report.compacted.total) + " tok",
+    "compression: " + compression,
+    "",
+    "checkpoints total: ~" + formatReportTokens(report.checkpoints.total) + " tok",
+    ...report.checkpoints.items.map(
+      (checkpoint) =>
+        " checkpoint #" +
+        checkpoint.number +
+        ": ~" +
+        formatReportTokens(checkpoint.tokens) +
+        " tok" +
+        (checkpoint.isNew ? " (new)" : ""),
+    ),
+    "",
+    "compacted content:",
+    " tool calls: ~" + formatReportTokens(report.compacted.toolCalls) + " tok",
+    " tool results: ~" + formatReportTokens(report.compacted.toolResults) + " tok",
+    " reasoning: ~" + formatReportTokens(report.compacted.reasoning) + " tok",
+  ]
+  if (report.compacted.other > 0) {
+    lines.push(" other: ~" + formatReportTokens(report.compacted.other) + " tok")
+  }
+  lines.push(
+    "",
+    "base context:",
+    " system prompt: ~" + formatReportTokens(report.baseContext.systemPrompt) + " tok",
+    " tool declarations: ~" + formatReportTokens(report.baseContext.toolDeclarations) + " tok",
+  )
+  if (report.baseContext.otherProviderOverhead > 0) {
+    lines.push(
+      " other provider overhead: ~" +
+        formatReportTokens(report.baseContext.otherProviderOverhead) +
+        " tok",
+    )
+  }
+  lines.push(
+    "",
+    "covered user messages: " +
+      (report.coveredUserMessages.length > 0
+        ? report.coveredUserMessages.join(", ")
+        : "(none)"),
+  )
+  if (report.mode === "standalone" && report.summary.trim().length > 0) {
+    lines.push("", "tools/results summary:", "", report.summary.trim())
+  }
+    return lines.join("\n")
+  }
+
+  export function formatPersistentCompactionReport(report: CompactionReport): string {
+    return formatCompactionReport(report, true)
+  }
 
 const PI_NATIVE_DISABLE_STATE = Symbol.for("pi-cache-compact.pi-native-disable.v2")
 
@@ -598,7 +747,21 @@ export default function cacheCompact(pi: ExtensionAPI): void {
     }
   >()
 
-  const optionsFor = (ctx: ExtensionContext): CacheCompactOptions => {
+  pi.registerEntryRenderer<CompactionReport>(
+  COMPACTION_REPORT_TYPE,
+  (entry) => {
+    if (!isCompactionReport(entry.data)) return undefined
+    return new CustomMessageComponent({
+      role: "custom",
+      customType: "cache-compact",
+      content: formatPersistentCompactionReport(entry.data),
+      display: true,
+      timestamp: Date.parse(entry.timestamp),
+    } as any)
+  },
+)
+
+const optionsFor = (ctx: ExtensionContext): CacheCompactOptions => {
     const cached = configs.get(ctx.cwd)
     if (cached) return cached
     const paths = [
@@ -765,121 +928,154 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   const pendingCompactionUi = new Map<string, PendingCompactionUi>()
   const compactionFailureReasons = new Map<string, string>()
 
-  const reportCompactionComplete = (
+  const takeCompactionReport = (
     ctx: ExtensionContext,
     fallbackBranch: CompactionBranch,
+    mode: CompactionReportMode,
     summary: string,
     tokensBefore: number,
-  ): void => {
+  ): CompactionReport | undefined => {
     const sessionId = ctx.sessionManager.getSessionId()
     const pending = pendingCompactionUi.get(sessionId)
     pendingCompactionUi.delete(sessionId)
     compactionFailureReasons.delete(sessionId)
-    const branch = pending?.branch ?? fallbackBranch
+    if (!pending) return undefined
 
-    let metrics = ""
-    if (pending) {
-      const checkpointMessage = {
-        role: "custom",
-        customType: PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
-        content: `## Tool Context Checkpoint #${pending.scope.nextCheckpointNumber}\n\n${summary}`,
-        display: false,
-        timestamp: Date.now(),
-      } as AgentMessage
-      const checkpointBaseTokens = estimateMessagesTokens(convertToLlm([checkpointMessage]))
-      const checkpointSize = Math.ceil(checkpointBaseTokens * pending.unreportedScale)
-      const checkpointCalibratedSize = Math.ceil(
-        checkpointBaseTokens * pending.tokens.calibratedScale,
-      )
-      const calibrationRatio = pending.tokens.calibratedScale / pending.tokens.scale
-      const calibrate = (tokens: number): number => Math.ceil(tokens * calibrationRatio)
-      const compactedRawCalibrated =
-        pending.compactedRawCalibratedTokens ?? calibrate(pending.compactedRawTokens)
-      const remainingRawCalibrated = calibrate(pending.remainingRawTokens)
-      const tailEstimatedCalibrated = calibrate(pending.tailEstimatedTokens)
-
-      const projectionMessages = ctx.sessionManager.buildSessionProjection()
-        .messages as AgentMessage[]
-      const providerMessages = convertToLlm(projectionMessages)
-      const systemPromptBaseTokens = estimateMessagesTokens(
-        providerMessages.filter((message) => message.role === "system"),
-      )
-      const systemPromptTokens = Math.ceil(
-        systemPromptBaseTokens * pending.tokens.calibratedScale,
-      )
-      const lastLive = [...recentLivePayloads]
-        .reverse()
-        .find((entry) => entry.sessionId === sessionId)
-      const lastLivePayload = (lastLive?.payload ?? {}) as { tools?: unknown }
-      const toolDeclarations = Array.isArray(lastLivePayload.tools)
-        ? lastLivePayload.tools
-        : activeToolDeclarations(pi.getAllTools(), pi.getActiveTools())
-      const toolDeclarationTokens = Math.ceil(
-        estimateMessagesTokens(toolDeclarations) * pending.tokens.calibratedScale,
-      )
-      const otherProviderOverhead = calibrate(
-        Math.max(
-          0,
-          tokensBefore -
-            pending.tokens.nonSystemTotal -
-            Math.ceil(systemPromptBaseTokens * pending.tokens.scale) -
-            Math.ceil(estimateMessagesTokens(toolDeclarations) * pending.tokens.scale),
-        ),
-      )
-      const structuralAfter =
-        calibrate(pending.tokens.preserved) +
-        checkpointCalibratedSize +
-        remainingRawCalibrated +
-        systemPromptTokens +
-        toolDeclarationTokens +
-        otherProviderOverhead
-      const anchoredAfter =
-        pending.reportedPrefixTokens === undefined
-          ? undefined
-          : Math.max(0, pending.reportedPrefixTokens - compactedRawCalibrated) +
-            checkpointCalibratedSize +
-            tailEstimatedCalibrated
-      const calibratedAfter =
-        anchoredAfter === undefined ? structuralAfter : Math.max(structuralAfter, anchoredAfter)
-      const compression =
-        checkpointCalibratedSize > 0
-          ? (compactedRawCalibrated / checkpointCalibratedSize).toFixed(1)
-          : "∞"
-      const covered =
-        pending.scope.coveredUserMessages.length > 0
-          ? pending.scope.coveredUserMessages.join(", ")
-          : "(none)"
-      metrics = [
-        `context before (Pi usage): ${tokensBefore} tok`,
-        `context after: ~${calibratedAfter} tok (provider-calibrated estimate)`,
-        `compacted raw: ~${compactedRawCalibrated} tok`,
-        "",
-        `preserved dialogue: ~${calibrate(pending.tokens.preservedDialogue)} tok`,
-        ` user messages: ~${calibrate(pending.tokens.preservedUserMessages)} tok`,
-        ` assistant text: ~${calibrate(pending.tokens.preservedAssistantText)} tok`,
-        `historical checkpoints: ~${calibrate(pending.tokens.historicalCheckpoints)} tok (${pending.tokens.checkpointCount})`,
-        `raw technical before: ~${calibrate(pending.tokens.newRawCompactable)} tok`,
-        ` older raw compacted: ~${compactedRawCalibrated} tok`,
-        ` newest raw kept: ~${remainingRawCalibrated} tok`,
-        ` tool calls: ~${calibrate(pending.tokens.rawToolCalls)} tok`,
-        ` tool results: ~${calibrate(pending.tokens.rawToolResults)} tok`,
-        ` reasoning: ~${calibrate(pending.tokens.rawReasoning)} tok`,
-        ` other: ~${calibrate(pending.tokens.rawOther)} tok`,
-        `new checkpoint #${pending.scope.nextCheckpointNumber}: ~${checkpointCalibratedSize} tok`,
-        `system prompt: ~${systemPromptTokens} tok`,
-        `tool declarations: ~${toolDeclarationTokens} tok`,
-        `other provider overhead: ~${otherProviderOverhead} tok`,
-        `checkpoint user messages: ${covered}`,
-        `compression: ${compression}x`,
-        "",
-      ].join("\n")
-    }
-
-    notify(
-      ctx,
-      `[cache-compact] compact complete: ${branch}\n${metrics}tools/results summary:\n${summary.trim() || "(empty)"}`,
-      "info",
+    const checkpointMessage = {
+      role: "custom",
+      customType: PRESERVE_DIALOGUE_CHECKPOINT_TYPE,
+      content:
+        "## Tool Context Checkpoint #" +
+        pending.scope.nextCheckpointNumber +
+        "\n\n" +
+        summary,
+      display: false,
+      timestamp: Date.now(),
+    } as AgentMessage
+    const checkpointBaseTokens = estimateMessagesTokens(convertToLlm([checkpointMessage]))
+    const checkpointCalibratedSize = Math.ceil(
+      checkpointBaseTokens * pending.tokens.calibratedScale,
     )
+    const calibrationRatio = pending.tokens.calibratedScale / pending.tokens.scale
+    const calibrate = (tokens: number): number => Math.ceil(tokens * calibrationRatio)
+    const compactedRawCalibrated =
+      pending.compactedRawCalibratedTokens ?? calibrate(pending.compactedRawTokens)
+    const remainingRawCalibrated = calibrate(pending.remainingRawTokens)
+    const tailEstimatedCalibrated = calibrate(pending.tailEstimatedTokens)
+
+    const branchEntries = ctx.sessionManager.getBranch() as SessionEntry[]
+    const historicalStates = preserveDialogueStates(branchEntries).slice(
+      0,
+      pending.tokens.checkpointCount,
+    )
+    const historicalMessages = preservedCheckpointMessages(branchEntries).slice(
+      0,
+      pending.tokens.checkpointCount,
+    )
+    const checkpointItems: CompactionReportCheckpoint[] = historicalStates.map(
+      (state, index) => ({
+        number: state.details?.checkpoint?.number ?? index + 1,
+        tokens:
+          historicalMessages[index] === undefined
+            ? 0
+            : Math.ceil(
+                estimateMessagesTokens(convertToLlm([historicalMessages[index]])) *
+                  pending.tokens.calibratedScale,
+              ),
+        isNew: false,
+      }),
+    )
+    checkpointItems.push({
+      number: pending.scope.nextCheckpointNumber,
+      tokens: checkpointCalibratedSize,
+      isNew: true,
+    })
+
+    const projectionMessages = ctx.sessionManager.buildSessionProjection().messages as AgentMessage[]
+    const providerMessages = convertToLlm(projectionMessages)
+    const systemPromptBaseTokens = estimateMessagesTokens(
+      providerMessages.filter((message) => message.role === "system"),
+    )
+    const systemPromptTokens = Math.ceil(
+      systemPromptBaseTokens * pending.tokens.calibratedScale,
+    )
+    const lastLive = [...recentLivePayloads]
+      .reverse()
+      .find((entry) => entry.sessionId === sessionId)
+    const lastLivePayload = (lastLive?.payload ?? {}) as { tools?: unknown }
+    const toolDeclarations = Array.isArray(lastLivePayload.tools)
+      ? lastLivePayload.tools
+      : activeToolDeclarations(pi.getAllTools(), pi.getActiveTools())
+    const toolDeclarationBaseTokens = estimateMessagesTokens(toolDeclarations)
+    const toolDeclarationTokens = Math.ceil(
+      toolDeclarationBaseTokens * pending.tokens.calibratedScale,
+    )
+    const otherProviderOverhead = calibrate(
+      Math.max(
+        0,
+        tokensBefore -
+          pending.tokens.nonSystemTotal -
+          Math.ceil(systemPromptBaseTokens * pending.tokens.scale) -
+          Math.ceil(toolDeclarationBaseTokens * pending.tokens.scale),
+      ),
+    )
+    const structuralAfter =
+      calibrate(pending.tokens.preserved) +
+      checkpointCalibratedSize +
+      remainingRawCalibrated +
+      systemPromptTokens +
+      toolDeclarationTokens +
+      otherProviderOverhead
+    const anchoredAfter =
+      pending.reportedPrefixTokens === undefined
+        ? undefined
+        : Math.max(0, pending.reportedPrefixTokens - compactedRawCalibrated) +
+          checkpointCalibratedSize +
+          tailEstimatedCalibrated
+    const afterEstimated =
+      anchoredAfter === undefined ? structuralAfter : Math.max(structuralAfter, anchoredAfter)
+
+    const rawTotalCalibrated = calibrate(pending.tokens.newRawCompactable)
+    const compactedRatio =
+      rawTotalCalibrated > 0 ? Math.min(1, compactedRawCalibrated / rawTotalCalibrated) : 0
+    let unclassified = compactedRawCalibrated
+    const apportioned = (tokens: number): number => {
+      const value = Math.min(unclassified, Math.ceil(calibrate(tokens) * compactedRatio))
+      unclassified -= value
+      return value
+    }
+    const toolResults = apportioned(pending.tokens.rawToolResults)
+    const toolCalls = apportioned(pending.tokens.rawToolCalls)
+    const reasoning = apportioned(pending.tokens.rawReasoning)
+
+    const base: CompactionReportBase = {
+      version: 1,
+      trigger: pending.branch ?? fallbackBranch,
+      checkpointNumber: pending.scope.nextCheckpointNumber,
+      context: { before: tokensBefore, afterEstimated },
+      compacted: {
+        total: compactedRawCalibrated,
+        toolCalls,
+        toolResults,
+        reasoning,
+        other: unclassified,
+      },
+      checkpoints: {
+        total: checkpointItems.reduce((sum, checkpoint) => sum + checkpoint.tokens, 0),
+        items: checkpointItems,
+      },
+      baseContext: {
+        systemPrompt: systemPromptTokens,
+        toolDeclarations: toolDeclarationTokens,
+        otherProviderOverhead,
+      },
+      compression:
+        checkpointCalibratedSize > 0 ? compactedRawCalibrated / checkpointCalibratedSize : null,
+      coveredUserMessages: [...pending.scope.coveredUserMessages],
+    }
+    return mode === "standalone"
+      ? { ...base, mode, summary }
+      : { ...base, mode }
   }
 
   const reportCompactionFailure = (
@@ -1090,9 +1286,6 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         return
       }
 
-      reportCompactionComplete(ctx, triggerBranch, result.compaction.summary, usage.tokens)
-      log.record("dynamic_compaction_complete", { sessionId, cancelled: false })
-
       const resultDetails = result.compaction.details as CacheCompactDetails
       const rawTailStartEntryId =
       resultDetails.checkpoint?.rawTailStartEntryId ?? event.messageEntryId
@@ -1103,7 +1296,18 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       details: resultDetails,
       rawTailStartEntryId,
       })
-      return { entries: [...event.entries, ...checkpointEntries] }
+      const report = takeCompactionReport(
+        ctx,
+        triggerBranch,
+        "standalone",
+        result.compaction.summary,
+        usage.tokens,
+      )
+      const reportEntries = report
+        ? [{ type: "custom" as const, customType: COMPACTION_REPORT_TYPE, data: report }]
+        : []
+      log.record("dynamic_compaction_complete", { sessionId, cancelled: false })
+      return { entries: [...event.entries, ...checkpointEntries, ...reportEntries] }
     } catch (error) {
       reportCompactionFailure(ctx, triggerBranch, false, String(error))
       log.record("dynamic_compaction_check_failed", {
@@ -1140,8 +1344,8 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       /* observation must never break the request path */
     }
     try {
-      const messages = (event.payload as { messages?: unknown } | undefined)?.messages
-      if (Array.isArray(messages)) liveRequestCounts.set(sessionId, messages.length)
+      const messages = providerPayloadMessages(event.payload)
+      liveRequestCounts.set(sessionId, messages.length)
     } catch {
       /* observation must never break the request path */
     }
@@ -1163,10 +1367,9 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         const pending = pendingPostCompactionContext.get(sessionId)
         if (pending) {
           pendingPostCompactionContext.delete(sessionId)
-          const before = (pending.beforePayload ?? {}) as { messages?: unknown }
-          const after = payload as { messages?: unknown; tools?: unknown }
-          const beforeMessages = Array.isArray(before.messages) ? before.messages : []
-          const afterMessages = Array.isArray(after.messages) ? after.messages : []
+          const after = payload as { tools?: unknown }
+          const beforeMessages = providerPayloadMessages(pending.beforePayload)
+          const afterMessages = providerPayloadMessages(payload)
           const beforeRolling = rollingMessageHashes(beforeMessages)
           const afterRolling = rollingMessageHashes(afterMessages)
           const stableMessages = sharedPrefixLength(beforeRolling, afterRolling)
@@ -1388,8 +1591,11 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       ...event.preparation.turnPrefixMessages,
     ]) as AgentMessage[]
     // preserveEvent is defined once at the compaction boundary above.
-    const branchEntries = event.branchEntries as SessionEntry[]
-    let preserveTailStartEntryId =
+  const branchEntries = event.branchEntries as SessionEntry[]
+  const manualFirstKeptEntryId = nativeManualPreserve
+    ? (firstTranscriptEntryId(branchEntries) ?? event.preparation.firstKeptEntryId)
+    : event.preparation.firstKeptEntryId
+  let preserveTailStartEntryId =
     options.preserveDialogue === true ? preserveEvent.preserveTailStartEntryId : undefined
     let preserveDeltaAgent = preserveDialogueDeltaMessages(branchEntries, preserveTailStartEntryId)
     let preserveScope =
@@ -1839,7 +2045,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
                 parentId: null,
                 timestamp: new Date().toISOString(),
                 summary,
-                firstKeptEntryId: event.preparation.firstKeptEntryId,
+          firstKeptEntryId: manualFirstKeptEntryId,
                 tokensBefore: event.preparation.tokensBefore,
                 details,
               } as SessionEntry,
@@ -2099,7 +2305,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       return {
         compaction: {
           summary,
-          firstKeptEntryId: event.preparation.firstKeptEntryId,
+      firstKeptEntryId: manualFirstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
           usage: response.usage,
           details,
@@ -2123,12 +2329,14 @@ export default function cacheCompact(pi: ExtensionAPI): void {
     ) {
       return
     }
-    reportCompactionComplete(
+    const report = takeCompactionReport(
       ctx,
       "manual",
+      "supplemental",
       event.compactionEntry.summary,
       event.compactionEntry.tokensBefore,
     )
+    if (report) pi.appendEntry(COMPACTION_REPORT_TYPE, report)
     try {
       loggerFor(optionsFor(ctx)).record("manual_compaction_complete", {
         sessionId: ctx.sessionManager.getSessionId(),

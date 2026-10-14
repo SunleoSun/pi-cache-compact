@@ -444,9 +444,10 @@ test("modern manual preserve compaction retains earlier immutable checkpoints", 
     parentId: null,
     timestamp: "2026-01-01T00:00:03.000Z",
     summary: "MANUAL CHECKPOINT",
-    firstKeptEntryId: "u2",
+    firstKeptEntryId: "u1",
     tokensBefore: 2000,
     details: manualDetails,
+    systemMessage: { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
   }
   const branch = [
     message("u1", "user", "USER ONE"),
@@ -478,6 +479,7 @@ test("modern manual preserve compaction retains earlier immutable checkpoints", 
     ).length,
     1,
   )
+  assert.equal(rebuilt.filter((item: any) => item.role === "system").length, 0)
 })
 
 test("latest preserve compaction restores dialogue across earlier compactions without duplicating summaries", () => {

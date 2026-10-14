@@ -194,6 +194,22 @@ function entryMessages(entry: SessionEntry, edit: ContextEditEntry | undefined):
     )
 }
 
+function compactionCheckpointMessages(
+  entry: Extract<SessionEntry, { type: "compaction" }>,
+): AgentMessage[] {
+  const converted = entryMessages(entry, undefined).filter((message) => message.role !== "system")
+  if (converted.length > 0) return converted
+  return [
+    {
+      role: "compactionSummary",
+      summary: entry.summary,
+      tokensBefore: entry.tokensBefore,
+      timestamp: Number.isFinite(Date.parse(entry.timestamp)) ? Date.parse(entry.timestamp) : 0,
+    } as AgentMessage,
+  ]
+}
+
+
 export function isPreservedAssistantReply(
 message: AgentMessage,
 ): message is Extract<AgentMessage, { role: "assistant" }> {
@@ -281,20 +297,8 @@ export function preservedCheckpointMessages(
       messages.push(...entryMessages(state.entry, edits.get(state.entry.id)))
       continue
     }
-    const converted = entryMessages(state.entry, undefined)
-    if (converted.length > 0) {
-      messages.push(...converted)
-      continue
-    }
     if (state.entry.type === "compaction") {
-      messages.push({
-        role: "compactionSummary",
-        summary: state.summary,
-        tokensBefore: state.entry.tokensBefore,
-        timestamp: Number.isFinite(Date.parse(state.entry.timestamp))
-          ? Date.parse(state.entry.timestamp)
-          : 0,
-      } as AgentMessage)
+      messages.push(...compactionCheckpointMessages(state.entry))
     }
   }
   return messages
@@ -331,19 +335,7 @@ export function preservedContextMessages(
     }
 
     if (state.entry.type === "compaction") {
-      const converted = entryMessages(state.entry, undefined)
-      if (converted.length > 0) {
-        out.push(...converted)
-      } else {
-        out.push({
-          role: "compactionSummary",
-          summary: state.summary,
-          tokensBefore: state.entry.tokensBefore,
-          timestamp: Number.isFinite(Date.parse(state.entry.timestamp))
-            ? Date.parse(state.entry.timestamp)
-            : 0,
-        } as AgentMessage)
-      }
+      out.push(...compactionCheckpointMessages(state.entry))
     }
   }
 
