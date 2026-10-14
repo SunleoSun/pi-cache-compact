@@ -133,32 +133,46 @@ Configuration is merged from:
 1. `<agent-dir>/cache-compact.json`
 2. `<cwd>/.pi/cache-compact.json` (project values win)
 
-Example:
+For normal preserve mode, **no config file is required**: `preserveDialogue` defaults to `true`, forward cache-friendly summarization is automatic, and preserve mode falls back to delta-only summarization when the cached shape cannot fit safely.
+
+A config file is mainly useful for diagnostics or deliberate overrides. For example:
 
 ```json
 {
-  "preserveDialogue": true,
-  "continuation": true,
   "debug": true,
-  "debugFile": "/tmp/cache-compact-debug.jsonl"
+  "debugFile": "/absolute/path/cache-compact-debug.jsonl"
 }
 ```
 
+### Common preserve-mode options
+
 | Option | Meaning |
 |---|---|
-| `enabled` | Disable the extension with `false`. |
-| `models` | Optional `provider/modelId` allowlist. |
-| `summaryModel` | Optional `{ provider, id }` summarizer; falls back to active model. |
-| `summaryPrompt` | Replace the default summary instruction. |
-| `preserveDialogue` | Preserve dialogue + append-only technical checkpoints. Default `true`. |
-| `summaryReasoningEffort` | Explicit summary effort. Omitted mirrors the last live request. |
-| `cacheRetention` | Provider cache retention: `none`, `short`, `long`; default `short`. |
-| `toolChoice` | Optional `none`/`auto` override. By default cache-friendly summaries mirror the last live request, including an omitted tool-choice field; delta-only/text-only retries use `none`. |
-| `continuation` | Prefer a forward continuation of the cached conversation. Default `true`. |
-| `rewindWhenNeeded` | Legacy/non-preserve control that permits a dropped-span request when no continuation fits. Preserve mode automatically uses delta-only summaries when needed. |
-| `debug` | Master debug switch. `false` (default) disables stderr/structured debug output and never creates/touches `debugFile`. |
-| `debugFile` | Absolute JSONL path for structured diagnostics. The file is written only when `debug: true`. |
-| `debugPayloads` | Optional compact payload dumps around compaction for `compare-dumps.mjs`; conversation messages are retained, but provider tool declarations are stored as names only. |
+| `enabled` | Set `false` to disable the extension. Default is enabled. |
+| `models` | Optional `provider/modelId` allowlist. Empty or omitted means every model. |
+| `preserveDialogue` | Preserve user messages and completed assistant replies verbatim and compact only technical state into append-only checkpoints. Default `true`. |
+| `debug` | Master debug switch. Default `false`; when false, `debugFile` is never created or touched. |
+| `debugFile` | Absolute JSONL path for structured diagnostics. Written only when `debug: true`. |
+| `debugPayloads` | Extra forensic payload dumps around compaction. Default `false`; requires `debug` + `debugFile`. Dumps contain conversation content, while provider tool declarations are reduced to names. |
+
+### Advanced summary overrides
+
+These are supported and covered by tests, but normal preserve-mode use should leave them unset unless you deliberately want to change summary behavior or provider request options.
+
+| Option | Meaning |
+|---|---|
+| `summaryModel` | Optional `{ provider, id }` summarizer. Falls back to the active model when unset or unresolved. |
+| `summaryPrompt` | Replace the default checkpoint-summary instruction. |
+| `summaryReasoningEffort` | Explicit summary effort. When omitted, mirrors the last live request. |
+| `cacheRetention` | Summary-request cache retention: `none`, `short`, or `long`. Default `short`. |
+| `toolChoice` | Optional `none`/`auto` override. When omitted, cache-friendly summaries mirror the last live request; delta-only/text-only retries use `none`. |
+
+### Legacy non-preserve options
+
+| Option | Meaning |
+|---|---|
+| `continuation` | Legacy non-preserve request-shaping switch. Non-preserve mode treats omitted/`true` as forward continuation and `false` as the dropped-span request. **Preserve mode ignores this setting** and always tries cache-friendly continuation before its delta-only safety path. |
+| `rewindWhenNeeded` | Legacy non-preserve opt-in that permits a dropped-span rewind when no continuation fits. Preserve mode does not use this gate. |
 
 Summary provider failures use Pi's effective `settings.retry` policy before compaction is rejected. Cache-compact uses the same transient-error classifier and the same `retry.enabled`, `retry.maxRetries`, `retry.baseDelayMs`, and `retry.maxAgentDelayMs` values as Pi's own compaction/branch-summary path; there is no separate retry configuration. In an interactive Pi UI, scheduled provider retries show the attempt number and wait time, and deterministic summary retries / delta-only transitions are also announced so a long compaction does not look stuck.
 

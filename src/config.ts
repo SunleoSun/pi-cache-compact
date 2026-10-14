@@ -75,8 +75,10 @@ export interface CacheCompactOptions {
   */
   toolChoice?: "none" | "auto"
   /**
-   * Whether the summarization *request* is a strict forward continuation of the
-   * live conversation (default true) or only the span compaction drops.
+   * Legacy non-preserve request-shaping switch. Preserve mode ignores this
+   * setting and always tries a cache-friendly forward continuation before its
+   * delta-only safety path. In non-preserve mode, omitted/true means a strict
+   * forward continuation and false means only the span compaction drops.
    *
    * Why this matters, verified on a llama.cpp endpoint: the server's cache is
    * append-only. A request that extends the checkpoint the slot already holds is
@@ -86,9 +88,8 @@ export interface CacheCompactOptions {
    * and always re-prefills. Appending the ask to the full message list instead
    * keeps the request forward, and only the ask is evaluated.
    *
-   * Automatically falls back to the dropped-span shape when the continuation
-   * would not fit the context window (see `continuationFits`), because a
-   * request that overflows is rejected outright and Pi's cold default runs.
+   * In non-preserve mode, falls back to the dropped-span shape when the
+   * continuation would not fit the context window (see `continuationFits`).
    */
   continuation?: boolean
   /**

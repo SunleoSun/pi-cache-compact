@@ -2062,6 +2062,7 @@ test("honours a custom prompt, a summarizer model, and custom instructions", asy
   const ws = tempWorkspace({
     summaryModel: { provider: "mock", id: "small" },
     summaryPrompt: "CUSTOM HANDOFF",
+    cacheRetention: "long",
     obsoleteSummaryMaxTokens: 321,
   })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
@@ -2072,6 +2073,7 @@ test("honours a custom prompt, a summarizer model, and custom instructions", asy
 
     assert.equal(calls.complete[0].model, small)
     assert.equal(calls.complete[0].options.maxTokens, 13_107)
+    assert.equal(calls.complete[0].options.cacheRetention, "long")
     // Unset summaryReasoningEffort must leave the server's default effort
     // untouched — sending null/undefined explicitly would change the request.
     assert.equal("reasoningEffort" in calls.complete[0].options, false)

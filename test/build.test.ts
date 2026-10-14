@@ -482,6 +482,18 @@ test("preserve plan uses reserveTokens as output ceiling and clips only to actua
   assert.equal(plan.requestFits, true)
   assert.equal(plan.maxTokens, preserveReserveTokens(50_000))
 
+  const preserveIgnoresLegacyContinuation = planSummaryRequest({
+    liveMessages,
+    requestMessages: liveMessages,
+    droppedMessages: liveMessages,
+    keptCount: 0,
+    options: { preserveDialogue: true, continuation: false },
+    contextWindow: 50_000,
+    reserveTokens: preserveReserveTokens(50_000),
+    modelMaxTokens: 32_000,
+  })
+  assert.equal(preserveIgnoresLegacyContinuation.shape, "continuation")
+
   const tooLate = planSummaryRequest({
     liveMessages,
     requestMessages: liveMessages,
