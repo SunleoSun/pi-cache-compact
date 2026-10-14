@@ -44,6 +44,7 @@ import {
   computeFileListsFromMessages,
   formatFileOperations,
   extractLiveReasoningEffort,
+  extractLiveToolChoice,
   extractSummaryText,
   isModelAllowed,
   messagesBeforeEntry,
@@ -54,14 +55,17 @@ import {
   preserveSummaryOrdinalRejection,
   replayableHeaders,
   resolveSummaryReasoningEffort,
+  resolveSummaryToolChoice,
   summaryRejection,
   summaryOutputCap,
   tokenScale,
   unreportedTokenScale,
   looksLikeToolCall,
   NO_TEXT_REPLY,
+  PARSED_TOOL_CALL_REPLY,
   TOOL_CALL_TEXT_REPLY,
   type LiveEffort,
+  type LiveToolChoice,
   type SummaryRequestPlan,
   type SummaryRequestShape,
 } from "./build.ts"
@@ -84,6 +88,7 @@ import {
   isPreservedAssistantReply,
   latestPreserveDialogueState,
   preserveDeltaScope,
+  preserveDeltaTailCandidates,
   preserveDialogueBoundaryEntries,
   preserveDialogueDeltaMessages,
   preserveDialogueStates,
@@ -260,6 +265,7 @@ type CompactionTokenBreakdown = {
   rawOther: number
   nonSystemTotal: number
   scale: number
+  calibratedScale: number
 }
 
 function compactionMessageTokens(
@@ -272,6 +278,7 @@ function compactionMessageTokens(
     branchEntries,
   )
   const liveMessages = convertToLlm(effectiveAgent)
+  const calibratedScale = tokenScale(liveMessages)
   const scale = unreportedTokenScale(liveMessages)
   const nonSystemMessages = liveMessages.filter((message) => message.role !== "system")
   const estimate = (messages: readonly AgentMessage[]): number =>
@@ -318,6 +325,7 @@ function compactionMessageTokens(
     rawOther: Math.max(0, newRawCompactable - classified),
     nonSystemTotal,
     scale,
+    calibratedScale,
   }
 }
 
@@ -465,6 +473,7 @@ async function generateSummary(
   options: CacheCompactOptions,
   summarizer: Model<Api>,
   reasoningEffort: string | undefined,
+  toolChoice: "auto" | "none" | undefined,
   plan: SummaryRequestPlan,
   onPayload?: (
     payload: unknown,
@@ -502,7 +511,7 @@ async function generateSummary(
         maxTokens: plan.maxTokens,
         signal: event.signal,
         cacheRetention: options.cacheRetention ?? "short",
-        toolChoice: options.toolChoice ?? "none",
+        ...(toolChoice !== undefined ? { toolChoice } : undefined),
         // Mirror the effort the live prefix was actually sent with (see
         // extractLiveReasoningEffort): on servers that render the effort into the
         // prompt, any mismatch — including plain omission — misses the whole
@@ -543,13 +552,22 @@ async function generateSummary(
     event.signal,
     {
       onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
-        loggerFor(options).record("summary_provider_retry_scheduled", {
-          sessionId,
-          attempt,
-          maxAttempts,
-          delayMs,
-          errorMessage,
-        })
+      loggerFor(options).record("summary_provider_retry_scheduled", {
+      sessionId,
+      attempt,
+      maxAttempts,
+      delayMs,
+      errorMessage,
+      })
+      const delayText =
+      delayMs >= 1000
+      ? `${Number.isInteger(delayMs / 1000) ? delayMs / 1000 : (delayMs / 1000).toFixed(1)}s`
+      : `${delayMs}ms`
+      notify(
+      ctx,
+      `[cache-compact] summary provider retry ${attempt}/${maxAttempts} in ${delayText}`,
+      "warning",
+      )
       },
       onRetryAttemptStart: () => {
         loggerFor(options).record("summary_provider_retry_attempt_start", { sessionId })
@@ -716,6 +734,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   // mirrors this so its prefix matches what the server cached. Captured on
   // every request, independent of debug settings.
   const liveEfforts = new Map<string, LiveEffort>()
+  const liveToolChoices = new Map<string, LiveToolChoice>()
 
   // How many messages the last live provider request carried, per session.
   // Messages appended since (the reply, tool results) are *not* in the
@@ -735,6 +754,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
   tokens: CompactionTokenBreakdown
   scope: ReturnType<typeof preserveDeltaScope>
   compactedRawTokens: number
+  compactedRawCalibratedTokens?: number
   remainingRawTokens: number
   tailEstimatedTokens: number
   unreportedScale: number
@@ -766,19 +786,26 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         display: false,
         timestamp: Date.now(),
       } as AgentMessage
-      const checkpointSize = Math.ceil(
-      estimateMessagesTokens(convertToLlm([checkpointMessage])) * pending.unreportedScale,
+      const checkpointBaseTokens = estimateMessagesTokens(convertToLlm([checkpointMessage]))
+      const checkpointSize = Math.ceil(checkpointBaseTokens * pending.unreportedScale)
+      const checkpointCalibratedSize = Math.ceil(
+        checkpointBaseTokens * pending.tokens.calibratedScale,
       )
-      const reclaimed = Math.max(0, pending.compactedRawTokens - checkpointSize)
-      const compression =
-        checkpointSize > 0 ? (pending.compactedRawTokens / checkpointSize).toFixed(1) : "∞"
+      const calibrationRatio = pending.tokens.calibratedScale / pending.tokens.scale
+      const calibrate = (tokens: number): number => Math.ceil(tokens * calibrationRatio)
+      const compactedRawCalibrated =
+        pending.compactedRawCalibratedTokens ?? calibrate(pending.compactedRawTokens)
+      const remainingRawCalibrated = calibrate(pending.remainingRawTokens)
+      const tailEstimatedCalibrated = calibrate(pending.tailEstimatedTokens)
 
       const projectionMessages = ctx.sessionManager.buildSessionProjection()
         .messages as AgentMessage[]
       const providerMessages = convertToLlm(projectionMessages)
+      const systemPromptBaseTokens = estimateMessagesTokens(
+        providerMessages.filter((message) => message.role === "system"),
+      )
       const systemPromptTokens = Math.ceil(
-        estimateMessagesTokens(providerMessages.filter((message) => message.role === "system")) *
-          pending.tokens.scale,
+        systemPromptBaseTokens * pending.tokens.calibratedScale,
       )
       const lastLive = [...recentLivePayloads]
         .reverse()
@@ -788,49 +815,57 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         ? lastLivePayload.tools
         : activeToolDeclarations(pi.getAllTools(), pi.getActiveTools())
       const toolDeclarationTokens = Math.ceil(
-        estimateMessagesTokens(toolDeclarations) * pending.tokens.scale,
+        estimateMessagesTokens(toolDeclarations) * pending.tokens.calibratedScale,
       )
-      const providerOverhead = Math.max(0, tokensBefore - pending.tokens.nonSystemTotal)
-      const otherProviderOverhead = Math.max(
-      0,
-      providerOverhead - systemPromptTokens - toolDeclarationTokens,
+      const otherProviderOverhead = calibrate(
+        Math.max(
+          0,
+          tokensBefore -
+            pending.tokens.nonSystemTotal -
+            Math.ceil(systemPromptBaseTokens * pending.tokens.scale) -
+            Math.ceil(estimateMessagesTokens(toolDeclarations) * pending.tokens.scale),
+        ),
       )
       const structuralAfter =
-      pending.tokens.preserved +
-      checkpointSize +
-      pending.remainingRawTokens +
-      systemPromptTokens +
-      toolDeclarationTokens +
-      otherProviderOverhead
+        calibrate(pending.tokens.preserved) +
+        checkpointCalibratedSize +
+        remainingRawCalibrated +
+        systemPromptTokens +
+        toolDeclarationTokens +
+        otherProviderOverhead
       const anchoredAfter =
-      pending.reportedPrefixTokens === undefined
-      ? undefined
-      : Math.max(0, pending.reportedPrefixTokens - pending.compactedRawTokens) +
-      checkpointSize +
-      pending.tailEstimatedTokens
-      const totalNew =
-      anchoredAfter === undefined ? structuralAfter : Math.max(structuralAfter, anchoredAfter)
+        pending.reportedPrefixTokens === undefined
+          ? undefined
+          : Math.max(0, pending.reportedPrefixTokens - compactedRawCalibrated) +
+            checkpointCalibratedSize +
+            tailEstimatedCalibrated
+      const calibratedAfter =
+        anchoredAfter === undefined ? structuralAfter : Math.max(structuralAfter, anchoredAfter)
+      const compression =
+        checkpointCalibratedSize > 0
+          ? (compactedRawCalibrated / checkpointCalibratedSize).toFixed(1)
+          : "∞"
       const covered =
         pending.scope.coveredUserMessages.length > 0
           ? pending.scope.coveredUserMessages.join(", ")
           : "(none)"
       metrics = [
-        `context before: ${tokensBefore} tok`,
-        `context after: ~${totalNew} tok`,
-        `reclaimed: ~${reclaimed} tok`,
+        `context before (Pi usage): ${tokensBefore} tok`,
+        `context after: ~${calibratedAfter} tok (provider-calibrated estimate)`,
+        `compacted raw: ~${compactedRawCalibrated} tok`,
         "",
-        `preserved dialogue: ${pending.tokens.preservedDialogue} tok`,
-        ` user messages: ~${pending.tokens.preservedUserMessages} tok`,
-        ` assistant text: ~${pending.tokens.preservedAssistantText} tok`,
-        `historical checkpoints: ${pending.tokens.historicalCheckpoints} tok (${pending.tokens.checkpointCount})`,
-        "raw technical before: " + pending.tokens.newRawCompactable + " tok",
-        "  older raw compacted: ~" + pending.compactedRawTokens + " tok",
-        "  newest raw kept: ~" + pending.remainingRawTokens + " tok",
-        "  tool calls: ~" + pending.tokens.rawToolCalls + " tok",
-        "  tool results: ~" + pending.tokens.rawToolResults + " tok",
-        "  reasoning: ~" + pending.tokens.rawReasoning + " tok",
-        "  other: ~" + pending.tokens.rawOther + " tok",
-        `new checkpoint #${pending.scope.nextCheckpointNumber}: ${checkpointSize} tok`,
+        `preserved dialogue: ~${calibrate(pending.tokens.preservedDialogue)} tok`,
+        ` user messages: ~${calibrate(pending.tokens.preservedUserMessages)} tok`,
+        ` assistant text: ~${calibrate(pending.tokens.preservedAssistantText)} tok`,
+        `historical checkpoints: ~${calibrate(pending.tokens.historicalCheckpoints)} tok (${pending.tokens.checkpointCount})`,
+        `raw technical before: ~${calibrate(pending.tokens.newRawCompactable)} tok`,
+        ` older raw compacted: ~${compactedRawCalibrated} tok`,
+        ` newest raw kept: ~${remainingRawCalibrated} tok`,
+        ` tool calls: ~${calibrate(pending.tokens.rawToolCalls)} tok`,
+        ` tool results: ~${calibrate(pending.tokens.rawToolResults)} tok`,
+        ` reasoning: ~${calibrate(pending.tokens.rawReasoning)} tok`,
+        ` other: ~${calibrate(pending.tokens.rawOther)} tok`,
+        `new checkpoint #${pending.scope.nextCheckpointNumber}: ~${checkpointCalibratedSize} tok`,
         `system prompt: ~${systemPromptTokens} tok`,
         `tool declarations: ~${toolDeclarationTokens} tok`,
         `other provider overhead: ~${otherProviderOverhead} tok`,
@@ -952,7 +987,9 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       const triggeringBatchRawEstimatedTokens = Math.ceil(
       estimateMessagesTokens(convertToLlm(triggeringRawTailAgentMessages)) * unreportedScale,
       )
-      const reportedPrefixTokens = promptTokensOf(event.message)
+      const providerMessage = event.message as AssistantMessage
+      const reportedPrefixTokens = promptTokensOf(providerMessage)
+      const providerUsage = providerMessage.usage
       const currentContextTokens = usage.tokens
       const scope = preserveDeltaScope(branchEntries, event.messageEntryId)
 
@@ -962,6 +999,12 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         contextTokens: currentContextTokens,
         reportedContextTokens: usage.tokens,
         reportedPrefixTokens: reportedPrefixTokens ?? null,
+                providerInputTokens: providerUsage?.input ?? null,
+        providerOutputTokens: providerUsage?.output ?? null,
+        providerReasoningTokens: providerUsage?.reasoning ?? null,
+        providerStopReason: providerMessage.stopReason ?? null,
+        providerCacheReadTokens: providerUsage?.cacheRead ?? null,
+        providerCacheWriteTokens: providerUsage?.cacheWrite ?? null,
         contextWindow,
         reserveTokens,
         thresholdTokens,
@@ -1037,10 +1080,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         preserveTailRawEstimatedTokens: triggeringBatchRawEstimatedTokens,
         preserveTailAgentMessages: triggeringBatchAgentMessages,
         preservePrefixTokens: reportedPrefixTokens,
-        preserveRecoveryRewind:
-        event.toolResults.length === 0 &&
-        event.message.role === "assistant" &&
-        event.message.stopReason === "length",
+        // Delta-only selection is handled by the summary planner.
         } as unknown as SessionBeforeCompactEvent
 
       const result = await handleCompaction(syntheticEvent, ctx)
@@ -1053,12 +1093,15 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       reportCompactionComplete(ctx, triggerBranch, result.compaction.summary, usage.tokens)
       log.record("dynamic_compaction_complete", { sessionId, cancelled: false })
 
+      const resultDetails = result.compaction.details as CacheCompactDetails
+      const rawTailStartEntryId =
+      resultDetails.checkpoint?.rawTailStartEntryId ?? event.messageEntryId
       const checkpointEntries = preserveDialogueBoundaryEntries({
-        branchEntries,
-        summary: result.compaction.summary,
-        tokensBefore: usage.tokens,
-        details: result.compaction.details as CacheCompactDetails,
-        rawTailStartEntryId: event.messageEntryId,
+      branchEntries,
+      summary: result.compaction.summary,
+      tokensBefore: usage.tokens,
+      details: resultDetails,
+      rawTailStartEntryId,
       })
       return { entries: [...event.entries, ...checkpointEntries] }
     } catch (error) {
@@ -1086,6 +1129,13 @@ export default function cacheCompact(pi: ExtensionAPI): void {
     try {
       const observed = extractLiveReasoningEffort(event.payload)
       if (observed !== undefined) liveEfforts.set(sessionId, observed)
+    } catch {
+      /* observation must never break the request path */
+    }
+    try {
+      const observed = extractLiveToolChoice(event.payload)
+      if (observed !== undefined) liveToolChoices.set(sessionId, observed)
+      else liveToolChoices.delete(sessionId)
     } catch {
       /* observation must never break the request path */
     }
@@ -1139,8 +1189,8 @@ export default function cacheCompact(pi: ExtensionAPI): void {
                   : null,
             },
             context: {
-              messages: snapshot(afterMessages),
-              tools: providerToolNames(after.tools),
+            messageIndex: debugContextIndex(afterMessages, 1, branchEntries),
+            tools: providerToolNames(after.tools),
             },
           })
         }
@@ -1222,7 +1272,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       preserveTailRawEstimatedTokens?: number
       preserveTailAgentMessages?: AgentMessage[]
       preservePrefixTokens?: number
-      preserveRecoveryRewind?: boolean
+      // Delta-only selection is automatic in preserve mode.
       }
     const nativeManualPreserve =
       options.preserveDialogue === true &&
@@ -1338,68 +1388,128 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       ...event.preparation.turnPrefixMessages,
     ]) as AgentMessage[]
     // preserveEvent is defined once at the compaction boundary above.
-    const preserveTailStartEntryId =
-      options.preserveDialogue === true ? preserveEvent.preserveTailStartEntryId : undefined
-    const preserveDeltaAgent = preserveDialogueDeltaMessages(
-      event.branchEntries as SessionEntry[],
-      preserveTailStartEntryId,
-    )
-    const preserveScope =
-      options.preserveDialogue === true
-        ? preserveDeltaScope(event.branchEntries as SessionEntry[], preserveTailStartEntryId)
-        : undefined
-    const summaryScopeAgent =
-      options.preserveDialogue === true ? preserveDeltaAgent : nativeDroppedAgent
+    const branchEntries = event.branchEntries as SessionEntry[]
+    let preserveTailStartEntryId =
+    options.preserveDialogue === true ? preserveEvent.preserveTailStartEntryId : undefined
+    let preserveDeltaAgent = preserveDialogueDeltaMessages(branchEntries, preserveTailStartEntryId)
+    let preserveScope =
+    options.preserveDialogue === true
+    ? preserveDeltaScope(branchEntries, preserveTailStartEntryId)
+    : undefined
+    let summaryScopeAgent =
+    options.preserveDialogue === true ? preserveDeltaAgent : nativeDroppedAgent
     const liveMessages = convertToLlm(effectiveAgent)
     const observedCount = liveRequestCounts.get(sessionId)
     const preserveTailMessageCount =
-      options.preserveDialogue === true ? (preserveEvent.preserveTailMessageCount ?? 0) : 0
+    options.preserveDialogue === true ? (preserveEvent.preserveTailMessageCount ?? 0) : 0
     const requestMessages =
-      preserveTailMessageCount > 0 && preserveTailMessageCount < liveMessages.length
-        ? liveMessages.slice(0, liveMessages.length - preserveTailMessageCount)
-        : observedCount !== undefined && observedCount > 0 && observedCount < liveMessages.length
-          ? liveMessages.slice(0, observedCount)
-          : liveMessages
-    const plan = planSummaryRequest({
-      liveMessages,
-      requestMessages,
-      requestPromptTokens:
-        options.preserveDialogue === true ? preserveEvent.preservePrefixTokens : undefined,
-      droppedMessages: convertToLlm(summaryScopeAgent),
-      keptCount:
-        options.preserveDialogue === true
-          ? preserveTailMessageCount
-          : projection.messages.length - nativeDroppedAgent.length,
-      // In preserve mode there is no retained pre-compaction turn suffix in
-      // the rebuilt model view: all old tool traffic is summarized and all old
-      // dialogue is restored independently.
-      turnPrefixCount:
-        options.preserveDialogue === true ? 0 : (event.preparation.turnPrefixMessages?.length ?? 0),
-      ...(options.preserveDialogue !== true && event.preparation.previousSummary
-        ? { previousSummary: event.preparation.previousSummary }
-        : undefined),
-      options,
-      customInstructions: event.customInstructions,
-      preserveUserMessageOrdinals: preserveScope?.coveredUserMessages,
-      allowPreserveRewind:
-      options.preserveDialogue === true &&
-      (options.rewindWhenNeeded === true || preserveEvent.preserveRecoveryRewind === true),
-      contextWindow: summaryContextWindow,
-      reserveTokens: summaryReserveTokens,
-      modelMaxTokens: (summarizer as { maxTokens?: number }).maxTokens,
+    preserveTailMessageCount > 0 && preserveTailMessageCount < liveMessages.length
+    ? liveMessages.slice(0, liveMessages.length - preserveTailMessageCount)
+    : observedCount !== undefined && observedCount > 0 && observedCount < liveMessages.length
+    ? liveMessages.slice(0, observedCount)
+    : liveMessages
+    const planSummary = (preferDeltaOnly = false): SummaryRequestPlan =>
+    planSummaryRequest({
+    liveMessages,
+    requestMessages,
+    requestPromptTokens:
+    options.preserveDialogue === true ? preserveEvent.preservePrefixTokens : undefined,
+    droppedMessages: convertToLlm(summaryScopeAgent),
+    keptCount:
+    options.preserveDialogue === true
+    ? preserveTailMessageCount
+    : projection.messages.length - nativeDroppedAgent.length,
+    turnPrefixCount:
+    options.preserveDialogue === true ? 0 : (event.preparation.turnPrefixMessages?.length ?? 0),
+    ...(options.preserveDialogue !== true && event.preparation.previousSummary
+    ? { previousSummary: event.preparation.previousSummary }
+    : undefined),
+    options,
+    customInstructions: event.customInstructions,
+    preserveUserMessageOrdinals: preserveScope?.coveredUserMessages,
+    preferDeltaOnly,
+    contextWindow: summaryContextWindow,
+    reserveTokens: summaryReserveTokens,
+    modelMaxTokens: (summarizer as { maxTokens?: number }).maxTokens,
     })
-    // The older raw delta must fit as a forward continuation of the previous
-    // provider prefix. Native Pi compaction and silent rewinds are not preserve
-    // fallbacks, so fail closed rather than changing summary scope.
+    const desiredPreserveOutput =
+    options.preserveDialogue === true
+    ? summaryOutputCap({
+    reserveTokens: summaryReserveTokens,
+    modelMaxTokens: (summarizer as { maxTokens?: number }).maxTokens,
+    preserveDialogue: true,
+    })
+    : undefined
+    const selectDeltaChunk = (): SummaryRequestPlan | undefined => {
+    if (options.preserveDialogue !== true || desiredPreserveOutput === undefined) return undefined
+    const candidates = preserveDeltaTailCandidates(branchEntries, preserveTailStartEntryId)
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const candidateTailStart = candidates[index]
+    const candidateDelta = preserveDialogueDeltaMessages(branchEntries, candidateTailStart)
+    const candidateScope = preserveDeltaScope(branchEntries, candidateTailStart)
+    const candidatePlan = planSummaryRequest({
+    liveMessages,
+    requestMessages,
+    requestPromptTokens: preserveEvent.preservePrefixTokens,
+    droppedMessages: convertToLlm(candidateDelta),
+    keptCount: preserveTailMessageCount,
+    turnPrefixCount: 0,
+    options,
+    customInstructions: event.customInstructions,
+    preserveUserMessageOrdinals: candidateScope.coveredUserMessages,
+    preferDeltaOnly: true,
+    contextWindow: summaryContextWindow,
+    reserveTokens: summaryReserveTokens,
+    modelMaxTokens: (summarizer as { maxTokens?: number }).maxTokens,
+    })
+    if (
+    candidatePlan.shape !== "delta-only" ||
+    !candidatePlan.requestFits ||
+    candidatePlan.maxTokens < desiredPreserveOutput
+    ) {
+    continue
+    }
+    preserveTailStartEntryId = candidateTailStart
+    preserveDeltaAgent = candidateDelta
+    preserveScope = candidateScope
+    summaryScopeAgent = candidateDelta
+    notify(
+    ctx,
+    "[cache-compact] technical delta is too large for one summary; compacting the older part and keeping the newest part raw",
+    "info",
+    )
+    log.record("summary_delta_chunked", {
+    sessionId,
+    rawTailStartEntryId: candidateTailStart,
+    compactedRawEntryCount: candidateScope.rawEntryCount,
+    requestShape: candidatePlan.shape,
+    maxTokens: candidatePlan.maxTokens,
+    })
+    return candidatePlan
+    }
+    return undefined
+    }
+    let plan = planSummary()
+
+    // When the complete delta-only request cannot keep the normal summary reserve,
+    // compact the largest safe older prefix and carry the newest suffix forward raw.
+    if (
+    options.preserveDialogue === true &&
+    desiredPreserveOutput !== undefined &&
+    (!plan.requestFits || (plan.shape === "delta-only" && plan.maxTokens < desiredPreserveOutput))
+    ) {
+    plan = selectDeltaChunk() ?? plan
+    }
+
     if (options.preserveDialogue === true && !plan.requestFits) {
-      return preserveFallback("preserve delta summary no longer fits previous provider prefix", {
-        sessionId,
-        tokensBefore: event.preparation.tokensBefore,
-        contextWindow: summaryContextWindow,
-        reserveTokens: summaryReserveTokens,
-        requestShape: plan.shape,
-        summaryOutputTokens: plan.maxTokens,
-      })
+    return preserveFallback("technical delta does not fit even without the cached prefix", {
+    sessionId,
+    tokensBefore: event.preparation.tokensBefore,
+    contextWindow: summaryContextWindow,
+    reserveTokens: summaryReserveTokens,
+    requestShape: plan.shape,
+    summaryOutputTokens: plan.maxTokens,
+    })
     }
 
     // The rewind is the one shape that has never reused a cache, and it costs
@@ -1411,6 +1521,13 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         tokensBefore: event.preparation.tokensBefore,
       })
     }
+    if (options.preserveDialogue === true && plan.shape === "delta-only") {
+    notify(
+    ctx,
+    "[cache-compact] cached summary request does not fit safely; summarizing only the technical delta",
+    "info",
+    )
+    }
     const askHash = shortHash(plan.ask)
 
     // Effort for the summary ask: explicit config, else whatever the last
@@ -1420,9 +1537,15 @@ export default function cacheCompact(pi: ExtensionAPI): void {
     const reasoningEffort = resolveSummaryReasoningEffort(
       options.summaryReasoningEffort,
       liveEfforts.get(sessionId),
-    )
+      )
+      const toolChoiceFor = (requestPlan: SummaryRequestPlan, textOnly = false) =>
+      resolveSummaryToolChoice(
+      options.toolChoice,
+      liveToolChoices.get(sessionId),
+      textOnly || requestPlan.shape === "delta-only",
+      )
 
-    // Fingerprint our summarization request at the exact payload pi-ai sends,
+      // Fingerprint our summarization request at the exact payload pi-ai sends,
     // tagged so the debug file can be diffed against the live-request
     // fingerprints from before_provider_request.
     const recordSummaryPayload = (
@@ -1507,7 +1630,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         askHash,
         maxTokens: plan.maxTokens,
         cacheRetention: options.cacheRetention ?? "short",
-        toolChoice: options.toolChoice ?? "none",
+        toolChoice: toolChoiceFor(plan),
         reasoningEffort,
         // The shape the request actually uses; `continuation` is the configured
         // option, which is ignored when the continuation would not fit.
@@ -1543,6 +1666,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
           options,
           summarizer,
           reasoningEffort,
+          toolChoiceFor(plan),
           plan,
           recordSummaryPayload,
           requestHeaders,
@@ -1554,9 +1678,13 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       }
       const durationMs = Date.now() - startedAt
       let rejection = summaryResponseRejection(response)
-      // Empty or tool-call-only replies get one deterministic retry. Cache usage is
-      // diagnostic only and never changes retry or checkpoint semantics.
-      if (rejection === NO_TEXT_REPLY || rejection === TOOL_CALL_TEXT_REPLY) {
+      const retryableSummaryReply = (reason: string | undefined): boolean =>
+        reason === NO_TEXT_REPLY ||
+        reason === PARSED_TOOL_CALL_REPLY ||
+        reason === TOOL_CALL_TEXT_REPLY
+      const retryUnusableSummary = async (basePlan: SummaryRequestPlan): Promise<void> => {
+        if (!retryableSummaryReply(rejection)) return
+        notify(ctx, "[cache-compact] summary response was unusable; retrying once", "info")
         log.both("summary reply was unusable; retrying once", {
           reason: rejection,
           sessionId,
@@ -1565,12 +1693,9 @@ export default function cacheCompact(pi: ExtensionAPI): void {
           blocks: describeContent(response.content, options.debugPayloads === true),
         })
         const retryPlan: SummaryRequestPlan = {
-          ...plan,
-          // The retry keeps the cached prefix (the nudge goes after the ask) and
-          // is concrete on purpose: a reply that stops inside the reasoning
-          // channel is best discouraged by naming exactly what the visible
-          // answer should start with, not by asking the model to "write text".
-          ask: `${plan.ask}\n\nReminder: reply with the summary text itself. Do not call any tools, do not write tool-call syntax, do not leave the summary in your reasoning, and do not end your turn before writing it — start with the summary's first heading.`,
+          ...basePlan,
+          // Keep the same request shape/cache prefix and append a concrete text-only nudge.
+          ask: `${basePlan.ask}\n\nReminder: reply with the summary text itself. Do not call any tools, do not write tool-call syntax, do not leave the summary in your reasoning, and do not end your turn before writing it — start with the summary's first heading.`,
         }
         const retryStartedAt = Date.now()
         try {
@@ -1581,6 +1706,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
             options,
             summarizer,
             reasoningEffort,
+            toolChoiceFor(retryPlan, true),
             retryPlan,
             recordSummaryPayload,
             requestHeaders,
@@ -1597,6 +1723,73 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         } catch (error) {
           log.record("summary_retry", { sessionId, error: String(error) })
           rejection = String(error)
+        }
+      }
+      await retryUnusableSummary(plan)
+
+      // Any cache-friendly summary that exhausts its own output budget gets one
+      // delta-only retry. This is independent of how the live assistant turn ended:
+      // the summary response itself proves that the cached request had too little room.
+      if (
+        rejection !== undefined &&
+        response.stopReason === "length" &&
+        options.preserveDialogue === true &&
+        plan.shape !== "delta-only"
+      ) {
+        const forwardShape = plan.shape
+        let deltaOnlyPlan = planSummary(true)
+        if (
+          desiredPreserveOutput !== undefined &&
+          (!deltaOnlyPlan.requestFits || deltaOnlyPlan.maxTokens < desiredPreserveOutput)
+        ) {
+          deltaOnlyPlan = selectDeltaChunk() ?? deltaOnlyPlan
+        }
+        log.record("summary_delta_only_retry_start", {
+          sessionId,
+          forwardShape,
+          requestShape: deltaOnlyPlan.shape,
+          requestFits: deltaOnlyPlan.requestFits,
+          maxTokens: deltaOnlyPlan.maxTokens,
+        })
+        if (deltaOnlyPlan.shape === "delta-only" && deltaOnlyPlan.requestFits) {
+          notify(
+            ctx,
+            "[cache-compact] cached summary hit its output limit; retrying with only the technical delta",
+            "info",
+          )
+          plan = deltaOnlyPlan
+          const deltaOnlyAskHash = shortHash(plan.ask)
+          pendingAskHashes.add(deltaOnlyAskHash)
+          const deltaOnlyStartedAt = Date.now()
+          let deltaOnlyError: string | undefined
+          try {
+            response = await generateSummary(
+              pi,
+              ctx,
+              event,
+              options,
+              summarizer,
+              reasoningEffort,
+              toolChoiceFor(plan),
+              plan,
+              recordSummaryPayload,
+              requestHeaders,
+            )
+            rejection = summaryResponseRejection(response)
+          } catch (error) {
+            deltaOnlyError = String(error)
+            rejection = deltaOnlyError
+          } finally {
+            pendingAskHashes.delete(deltaOnlyAskHash)
+          }
+          log.record("summary_delta_only_retry_result", {
+            sessionId,
+            durationMs: Date.now() - deltaOnlyStartedAt,
+            stopReason: deltaOnlyError ? undefined : response.stopReason,
+            reason: rejection,
+            error: deltaOnlyError,
+          })
+          if (!deltaOnlyError) await retryUnusableSummary(plan)
         }
       }
       if (rejection) {
@@ -1627,17 +1820,15 @@ export default function cacheCompact(pi: ExtensionAPI): void {
       // Cache usage remains available in summary_result diagnostics below.
 
       if (options.preserveDialogue === true) {
-        const branchEntries = event.branchEntries as SessionEntry[]
-        const rawTailStartEntryId = preserveEvent.preserveTailStartEntryId
-        const scope = preserveDeltaScope(branchEntries, rawTailStartEntryId)
-        if (nativeManualPreserve) {
-          details.checkpoint = {
-            summary,
-            tokensBefore: event.preparation.tokensBefore,
-            number: scope.nextCheckpointNumber,
-            coveredUserMessages: scope.coveredUserMessages,
-          }
-        }
+      const rawTailStartEntryId = preserveTailStartEntryId
+      const scope = preserveScope ?? preserveDeltaScope(branchEntries, rawTailStartEntryId)
+      details.checkpoint = {
+      summary,
+      tokensBefore: event.preparation.tokensBefore,
+      number: scope.nextCheckpointNumber,
+      coveredUserMessages: scope.coveredUserMessages,
+      ...(rawTailStartEntryId ? { rawTailStartEntryId } : {}),
+      }
         const tokens = compactionMessageTokens(ctx, branchEntries)
         const preview = nativeManualPreserve
           ? preservedContextMessages([
@@ -1686,12 +1877,40 @@ export default function cacheCompact(pi: ExtensionAPI): void {
               display: false,
               timestamp: Date.now(),
             } as AgentMessage)
-        const newCheckpointTokens = Math.ceil(
-        estimateMessagesTokens(convertToLlm([checkpointMessage])) * unreportedScale,
+        const checkpointBaseTokens = estimateMessagesTokens(convertToLlm([checkpointMessage]))
+        const newCheckpointTokens = Math.ceil(checkpointBaseTokens * unreportedScale)
+        const newCheckpointCalibratedTokens = Math.ceil(
+          checkpointBaseTokens * tokens.calibratedScale,
         )
-        const remainingRawCompactable = preserveEvent.preserveTailRawEstimatedTokens ?? 0
-        const compactedRaw = Math.max(0, tokens.newRawCompactable - remainingRawCompactable)
-        const reclaimed = Math.max(0, compactedRaw - newCheckpointTokens)
+        const compactedRawAgent = preserveDeltaAgent.filter(
+          (message) =>
+            message.role === "toolResult" ||
+            (message.role === "assistant" && !isPreservedAssistantReply(message)),
+        )
+        const compactedRawBaseTokens = estimateMessagesTokens(convertToLlm(compactedRawAgent))
+        const compactedRawEstimate = Math.ceil(compactedRawBaseTokens * tokens.scale)
+        const compactedRawCalibratedEstimate = Math.ceil(
+          compactedRawBaseTokens * tokens.calibratedScale,
+        )
+        const compactedRaw =
+          preserveDeltaAgent.length === 0 && tokens.newRawCompactable > 0
+            ? Math.max(
+                0,
+                tokens.newRawCompactable - (preserveEvent.preserveTailRawEstimatedTokens ?? 0),
+              )
+            : compactedRawEstimate
+        const compactedRawCalibrated =
+          preserveDeltaAgent.length === 0 && compactedRaw > 0
+            ? Math.ceil(compactedRaw * (tokens.calibratedScale / tokens.scale))
+            : compactedRawCalibratedEstimate
+        const remainingRawCompactable = Math.max(0, tokens.newRawCompactable - compactedRaw)
+        const pendingUi = pendingCompactionUi.get(sessionId)
+        if (pendingUi) {
+          pendingUi.scope = scope
+          pendingUi.compactedRawTokens = compactedRaw
+          pendingUi.compactedRawCalibratedTokens = compactedRawCalibrated
+          pendingUi.remainingRawTokens = remainingRawCompactable
+        }
         const checkpointHashes = preserveDialogueStates(branchEntries).map((state, index) => ({
           number: state.details?.checkpoint?.number ?? index + 1,
           entryId: "id" in state.entry ? state.entry.id : undefined,
@@ -1726,20 +1945,37 @@ export default function cacheCompact(pi: ExtensionAPI): void {
         )
         const providerOverhead = Math.max(0, event.preparation.tokensBefore - tokens.nonSystemTotal)
         const otherProviderOverhead = Math.max(
-        0,
-        providerOverhead - systemPromptTokens - toolDeclarationTokens,
+          0,
+          providerOverhead - systemPromptTokens - toolDeclarationTokens,
         )
         const estimatedAfterStructural = estimatedAfterMessages + toolDeclarationTokens
         const estimatedAfterAnchored =
-        preserveEvent.preservePrefixTokens === undefined
-        ? undefined
-        : Math.max(0, preserveEvent.preservePrefixTokens - compactedRaw) +
-        newCheckpointTokens +
-        (preserveEvent.preserveTailEstimatedTokens ?? 0)
+          preserveEvent.preservePrefixTokens === undefined
+            ? undefined
+          : Math.max(0, preserveEvent.preservePrefixTokens - compactedRaw) +
+            newCheckpointTokens +
+            (preserveEvent.preserveTailEstimatedTokens ?? 0)
         const estimatedAfter =
-        estimatedAfterAnchored === undefined
-        ? estimatedAfterStructural
-        : Math.max(estimatedAfterStructural, estimatedAfterAnchored)
+          estimatedAfterAnchored === undefined
+            ? estimatedAfterStructural
+            : Math.max(estimatedAfterStructural, estimatedAfterAnchored)
+        const calibrationRatio = tokens.calibratedScale / tokens.scale
+        const tailAfterPrefixCalibrated = Math.ceil(
+          (preserveEvent.preserveTailEstimatedTokens ?? 0) * calibrationRatio,
+        )
+        const estimatedAfterStructuralCalibrated = Math.ceil(
+          estimatedAfterStructural * calibrationRatio,
+        )
+        const estimatedAfterAnchoredCalibrated =
+          preserveEvent.preservePrefixTokens === undefined
+            ? undefined
+            : Math.max(0, preserveEvent.preservePrefixTokens - compactedRawCalibrated) +
+              newCheckpointCalibratedTokens +
+              tailAfterPrefixCalibrated
+        const estimatedAfterCalibrated =
+          estimatedAfterAnchoredCalibrated === undefined
+            ? estimatedAfterStructuralCalibrated
+            : Math.max(estimatedAfterStructuralCalibrated, estimatedAfterAnchoredCalibrated)
 
         log.record("preserve_compaction", {
           sessionId,
@@ -1766,6 +2002,7 @@ export default function cacheCompact(pi: ExtensionAPI): void {
             providerContextBefore: event.preparation.tokensBefore,
             reportedPrefixTokens: preserveEvent.preservePrefixTokens ?? null,
             estimateScale: tokens.scale,
+            providerCalibratedScale: tokens.calibratedScale,
             unreportedScale,
             estimatedNonSystemBefore: tokens.nonSystemTotal,
             providerPromptOverhead: providerOverhead,
@@ -1779,16 +2016,23 @@ export default function cacheCompact(pi: ExtensionAPI): void {
             historicalCheckpointCount: tokens.checkpointCount,
             newRawCompactable: tokens.newRawCompactable,
             compactedRaw,
+            compactedRawCalibrated,
             rawToolCalls: tokens.rawToolCalls,
             rawToolResults: tokens.rawToolResults,
             rawReasoning: tokens.rawReasoning,
             rawOther: tokens.rawOther,
             newCheckpoint: newCheckpointTokens,
+            newCheckpointCalibrated: newCheckpointCalibratedTokens,
             remainingRawCompactable,
+            tailAfterPrefix: preserveEvent.preserveTailEstimatedTokens ?? 0,
+            tailAfterPrefixCalibrated,
+            estimatedContextAfterStructuralCalibrated: estimatedAfterStructuralCalibrated,
+            estimatedContextAfterAnchoredCalibrated: estimatedAfterAnchoredCalibrated ?? null,
             estimatedContextAfterStructural: estimatedAfterStructural,
             estimatedContextAfterAnchored: estimatedAfterAnchored ?? null,
+            estimatedContextAfterCalibrated: estimatedAfterCalibrated,
             estimatedContextAfter: estimatedAfter,
-            estimatedReclaimed: reclaimed,
+            estimatedCompactedRaw: compactedRaw,
             compression: newCheckpointTokens > 0 ? compactedRaw / newCheckpointTokens : null,
           },
           cachePrefixPreview: {
@@ -1810,8 +2054,12 @@ export default function cacheCompact(pi: ExtensionAPI): void {
                     afterHash: shortHash(divergenceAfter),
                   },
           },
+          ...(options.debugPayloads === true
+          ? {
           contextBefore: snapshot(beforeStructural),
           contextAfter: snapshot(afterMessages),
+          }
+          : {}),
           contextIndex: {
             before: debugContextIndex(beforeStructural, tokens.scale, branchEntries),
             after: debugContextIndex(afterMessages, tokens.scale, branchEntries, {

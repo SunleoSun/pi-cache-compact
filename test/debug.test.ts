@@ -131,6 +131,31 @@ test("DebugLogger appends JSONL only when enabled with a file", () => {
   }
 })
 
+test("DebugLogger does not write stderr while stderr is a TTY", () => {
+const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stderr, "isTTY")
+const writeDescriptor = Object.getOwnPropertyDescriptor(process.stderr, "write")
+let writes = 0
+try {
+Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true })
+Object.defineProperty(process.stderr, "write", {
+configurable: true,
+value: () => {
+writes += 1
+return true
+},
+})
+const logger = new DebugLogger(true)
+logger.log("hidden-in-tui", { a: 1 })
+logger.both("also-hidden-in-tui", { b: 2 })
+assert.equal(writes, 0)
+} finally {
+if (ttyDescriptor) Object.defineProperty(process.stderr, "isTTY", ttyDescriptor)
+else delete (process.stderr as any).isTTY
+if (writeDescriptor) Object.defineProperty(process.stderr, "write", writeDescriptor)
+else delete (process.stderr as any).write
+}
+})
+
 test("DebugLogger keeps valid JSONL under the 1 MiB rolling cap", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cache-compact-cap-"))
   const file = path.join(dir, "debug.jsonl")
@@ -167,8 +192,19 @@ test("DebugLogger rolls canonical preserve_compaction records without losing the
         tokens: { providerContextBefore: 50_000, estimatedContextAfter: 10_000 },
       })
       logger.record("post_compaction_context", {
-        checkpointNumber: checkpoint,
-        context: { messages: [{ role: "custom", content: `summary-${checkpoint}` }], tools: [] },
+      checkpointNumber: checkpoint,
+      context: {
+      messageIndex: [
+      {
+      index: 0,
+      role: "custom",
+      kind: "custom",
+      estimatedTokens: 10,
+      hash: `hash-${checkpoint}`,
+      },
+      ],
+      tools: [],
+      },
       })
     }
 

@@ -67,23 +67,25 @@ The preserve prompt is deliberately **result-oriented**. It does not use a globa
 - (none)
 ```
 
-The original user prompt is already present verbatim, so the checkpoint identifies it only as `User message N` and does not paraphrase it. The extension also injects the exact absolute user-message ordinals covered by the new delta into the summary ask; this prevents a dropped/rewind request from renumbering a user turn merely because earlier dialogue is outside that request. A tool loop may continue across checkpoint boundaries; new tool evidence remains associated with the user message that initiated that work.
+The original user prompt is already present verbatim, so the checkpoint identifies it only as `User message N` and does not paraphrase it. The extension also injects the exact absolute user-message ordinals covered by the new delta into the summary ask; this prevents a delta-only summary request from renumbering a user turn merely because earlier dialogue is outside that request. A tool loop may continue across checkpoint boundaries; new tool evidence remains associated with the user message that initiated that work.
 
 Historical checkpoints are immutable prefix context. A later summarization request must not repeat, merge, update or supersede them.
 
 ## Cache behavior
 
-The summary request is normally a strict forward continuation of the live conversation: same system prompt, same tool declarations and same cached message prefix, then one extra user ask. `continuation: false` and `rewindWhenNeeded: true` are explicit opt-outs for servers where rewinding is acceptable.
+The summary request is normally a strict forward continuation of the live conversation: same system prompt, same tool declarations and same cached message prefix, then one extra user ask. Cache-sensitive request options mirror the last live payload by default, including whether tool choice was omitted. Preserve mode automatically switches to a **delta-only summary** when that cached request cannot fit safely; only the technical state being compacted is sent for that one summary call. `continuation: false` and `rewindWhenNeeded: true` remain legacy/non-preserve request-shaping controls.
 
 After compaction, divergence should start only where newly compacted raw tool/reasoning state disappeared. User/assistant dialogue and older checkpoints stay stable.
 
-When the current batch crosses the reserve boundary, the summary request continues from the previous provider prefix, before that batch. The batch is then placed raw after the new checkpoint, so it is never sacrificed merely to make the summary fit. On the next `turn_end` that carried batch is now older raw state and can be checkpointed even when the model produced no new tool results (for example a `length` stop). If that `length` turn reports a provider prefix that is already too large to append the checkpoint ask, preserve recovery uses a minimal cold rewind containing only a tiny recovery system/developer instruction, the exact compactable technical delta, and the checkpoint instruction; preserved dialogue, historical checkpoints, and the current truncated assistant tail are not copied into that cold request. Normal preserve checkpoints remain forward continuations. Because the recovery request is a brand-new prompt, its fit is estimated from scratch with the conservative UTF-8 bytes/3 baseline and margin: historical provider calibration and `usage` metadata embedded in raw assistant messages belong to the old live prefix and are deliberately ignored for recovery fit. The checkpoint's projected model message retains its append timestamp so Pi's context estimator invalidates stale assistant usage from the larger pre-checkpoint prompt before sizing the first post-checkpoint response. If no older compactable state exists, preserve mode does not manufacture a checkpoint.
+When the current batch crosses the reserve boundary, the summary request continues from the previous provider prefix, before that batch. The current batch stays raw after the new checkpoint and becomes eligible at the next `turn_end`. If the cache-friendly summary request cannot fit, preserve mode automatically sends a **delta-only summary request**: a tiny summary instruction plus only the exact technical delta being compacted. If a cache-friendly summary request fits but its generated summary itself stops at `length`, the same delta is retried once in delta-only form regardless of how the live assistant turn ended. If the complete delta-only request is still too large to leave the normal summary-output reserve, the extension compacts the largest safe older prefix and carries the newest unsummarized suffix forward as raw state after the checkpoint; that suffix is eligible for a later checkpoint. Boundaries are chosen before user/assistant messages, never before a tool result, so an assistant tool-call batch stays with its following results. Delta-only fit is estimated from scratch with the conservative UTF-8 bytes/3 baseline: stale provider calibration and embedded `usage` from the old full prefix are ignored. A single indivisible technical unit that itself cannot fit still fails closed rather than being silently dropped. Parsed/textual tool-call summaries and empty visible summaries get one deterministic text-only retry. The checkpoint's projected model message retains its append timestamp so Pi's estimator cannot reuse stale pre-checkpoint usage. If no older compactable state exists, preserve mode does not manufacture a checkpoint.
 
 ### Recovery certification
 
-The test suite includes a real-Pi/provider-level recovery certification, not only a mocked extension handler. It creates one normal preserve checkpoint, carries a large second tool batch raw, makes the next provider request report a 56,172-token prompt against a 50,000-token window and stop with `length`, then exercises the cold recovery rewind. The certification verifies that the recovery request contains the exact tool call ID/name/arguments and the complete 40,000-character tool result, uses the correct absolute owning user ordinal, and excludes preserved dialogue, earlier tool state/checkpoints, and the current truncated assistant tail.
+The test suite includes real-Pi/provider-level recovery certifications, not only mocked extension handlers. The direct-overflow case creates one normal preserve checkpoint, carries a large second tool batch raw, makes the next provider request report a 56,172-token prompt against a 50,000-token window and stop with `length`, then exercises the delta-only summary path. The certification verifies that the request contains the exact tool call ID/name/arguments and the complete 40,000-character tool result, uses the correct absolute owning user ordinal, and excludes preserved dialogue, earlier tool state/checkpoints, and the current truncated assistant tail.
 
-After the recovery checkpoint, the certification starts the next ordinary Pi request from the persisted session and inspects the actual provider payload. It verifies that preserved user dialogue and the earlier immutable checkpoint survive, the provider-message prefix before the compacted raw batch is byte-for-byte unchanged, the old tool call/result are gone from model-visible context, checkpoint #2 appears exactly in their place, the current `length` assistant tail remains raw, output headroom is greater than one token, and the model successfully produces a normal `done` response. The raw JSONL transcript is also checked to retain the original tool call/result, proving that recovery edits model context without destructively rewriting history.
+A second certification covers the production edge case where the cache-friendly summary request still fits, but the summary itself ends at `length`. Pi first attempts the cached checkpoint, the mock truncates that summary, then the extension retries the same exact technical delta with a delta-only request. The test verifies that the retry excludes checkpoint/preserved-prefix state, checkpoint #2 is persisted, the large raw result disappears from model-visible context, and a later ordinary Pi request continues successfully from checkpoints #1 + #2.
+
+After recovery, the certifications inspect actual provider payloads. They verify that preserved user dialogue and immutable checkpoints survive, the provider-message prefix before compacted raw state remains stable where applicable, compacted tool call/results are gone from model-visible context, the current `length` assistant tail remains raw, output headroom is usable, and the model successfully produces a normal `done` response. Raw JSONL remains append-only and retains the original tool traffic.
 
 ## Compaction UI
 
@@ -91,22 +93,22 @@ A successful preserve checkpoint reports the trigger and token accounting, for e
 
 ```text
 [cache-compact] compact complete: reserve threshold
-context before: 35562 tok
-context after: ~...
-reclaimed: ~...
+context before (Pi usage): 35562 tok
+context after: ~... tok (provider-calibrated estimate)
+compacted raw: ~... tok
 
-preserved dialogue: 2080 tok
+preserved dialogue: ~2080 tok
   user messages: ~1220 tok
   assistant text: ~860 tok
-historical checkpoints: 310 tok (1)
-raw technical before: 27192 tok
+historical checkpoints: ~310 tok (1)
+raw technical before: ~27192 tok
   older raw compacted: ~22000 tok
   newest raw kept: ~5192 tok
   tool calls: ~...
   tool results: ~...
   reasoning: ~...
   other: ~...
-new checkpoint #2: 220 tok
+new checkpoint #2: ~220 tok
 system prompt: ~4100 tok
 tool declarations: ~1650 tok
 other provider overhead: ~540 tok
@@ -114,7 +116,7 @@ checkpoint user messages: 5, 6
 compression: 123.6x
 ```
 
-`context before` is Pi's current usage. The breakdown and context-after values are local estimates and are marked with `~` where appropriate. When the current assistant carries server-reported prompt usage, the context-after estimate anchors to that exact provider prefix, subtracts the estimated compacted delta, and adds the new checkpoint/current raw tail. Unseen content is never discounted below the conservative bytes/3 estimate; a second structural estimate of messages plus tool declarations is retained and the larger estimate wins.
+`context before (Pi usage)` is Pi's current context usage at the boundary; it can include locally estimated newly appended tail state, so it is not always an exact provider token count. `context after` and every token count in the displayed breakdown use the same provider-calibrated scale. The UI takes the larger of its calibrated structural and reported-prefix-anchored estimates; conservative bytes/3 accounting remains internal for fit/safety decisions and structured debug audits.
 
 ## Configuration
 
@@ -143,34 +145,34 @@ Example:
 | `preserveDialogue` | Preserve dialogue + append-only technical checkpoints. Default `true`. |
 | `summaryReasoningEffort` | Explicit summary effort. Omitted mirrors the last live request. |
 | `cacheRetention` | Provider cache retention: `none`, `short`, `long`; default `short`. |
-| `toolChoice` | Summary request tool choice: `none` or `auto`; default `none`. Tool declarations remain for prefix identity. |
+| `toolChoice` | Optional `none`/`auto` override. By default cache-friendly summaries mirror the last live request, including an omitted tool-choice field; delta-only/text-only retries use `none`. |
 | `continuation` | Prefer a forward continuation of the cached conversation. Default `true`. |
-| `rewindWhenNeeded` | Permit a cold dropped-span rewind when no continuation fits. Default `false`; preserve recovery after an oversized `length` turn is the one automatic exception. |
+| `rewindWhenNeeded` | Legacy/non-preserve control that permits a dropped-span request when no continuation fits. Preserve mode automatically uses delta-only summaries when needed. |
 | `debug` | Master debug switch. `false` (default) disables stderr/structured debug output and never creates/touches `debugFile`. |
 | `debugFile` | Absolute JSONL path for structured diagnostics. The file is written only when `debug: true`. |
 | `debugPayloads` | Optional compact payload dumps around compaction for `compare-dumps.mjs`; conversation messages are retained, but provider tool declarations are stored as names only. |
 
-Summary provider failures use Pi's effective `settings.retry` policy before compaction is rejected. That means cache-compact uses the same transient-error classifier and the same `retry.enabled`, `retry.maxRetries`, `retry.baseDelayMs`, and `retry.maxAgentDelayMs` values as Pi's own compaction/branch-summary path; there is no separate retry configuration in this extension.
+Summary provider failures use Pi's effective `settings.retry` policy before compaction is rejected. Cache-compact uses the same transient-error classifier and the same `retry.enabled`, `retry.maxRetries`, `retry.baseDelayMs`, and `retry.maxAgentDelayMs` values as Pi's own compaction/branch-summary path; there is no separate retry configuration. In an interactive Pi UI, scheduled provider retries show the attempt number and wait time, and deterministic summary retries / delta-only transitions are also announced so a long compaction does not look stuck.
 
 `/compact` also uses the preserve-dialogue compactor when preserve mode is enabled. Manual compaction does not wait for the reserve threshold: it checkpoints all currently uncheckpointed technical state while preserving user messages and completed assistant answers. While preserve mode is active the extension keeps Pi's automatic compaction disabled and sets Pi's in-memory `keepRecentTokens` to 1, solely so manual preparation cannot reject a short session before the extension hook runs.
 
 ## Debugging and observability
 
-`debugFile` is written only when `debug: true` and a path is configured; `debug: false` never creates or touches it. It is a **rolling JSONL file with a hard 1 MiB limit**. Before appending a record that would exceed the limit, the logger evicts the oldest complete JSONL records. If one record alone is larger than 1 MiB, it is replaced by a small `log_record_oversize` marker. The logger never throws into the compaction path. The extension itself performs no other runtime filesystem writes; Pi still persists its own normal session/transcript files.
+`debugFile` is written only when `debug: true` and a path is configured; `debug: false` never creates or touches it. It is a **rolling JSONL file with a hard 1 MiB limit**. Before appending a record that would exceed the limit, the logger evicts the oldest complete JSONL records. If one record alone is larger than 1 MiB, it is replaced by a small `log_record_oversize` marker. The logger never throws into the compaction path. In interactive Pi TUI sessions debug diagnostics are not written directly to stderr, because asynchronous stderr output corrupts the composer area; user-facing compaction status goes through Pi notifications while structured diagnostics stay in JSONL. The extension itself performs no other runtime filesystem writes; Pi still persists its own normal session/transcript files.
 
-Provider cache metrics such as `cacheRead` and `cacheWrite` are observability only. They are logged, but never suppress, defer, retry-gate, or otherwise reshape compaction.
+Provider usage/cache metrics are observability only. Live input/output/reasoning counts, cache read/write counts, and stop reason are added to the existing `dynamic_compaction_pressure` record, so this costs only a few scalar fields per turn instead of another record. They never reshape compaction behavior.
 
 The canonical records are:
 
-- `preserve_compaction` — one self-contained audit record per successful preserve checkpoint. It contains checkpoint number/scope, absolute covered user-message ordinals, raw branch entry IDs/boundaries, historical checkpoint IDs/hashes, the provider tool declarations captured before compaction, full predicted model-visible `contextBefore` and `contextAfter`, a per-message index (`role`, semantic kind, source session-entry ID, checkpoint number, estimated tokens, hash), complete token accounting, compression/reclaimed estimates, and a structural stable-prefix diagnostic including the first divergence.
-- `post_compaction_context` — the **actual next provider** messages/tool declarations after the checkpoint when the same Pi process continues, plus an exact provider-message shared-prefix count against the previous live request and hashes of the checkpoints present in the branch. If a `length` stop ends that process and the session is resumed later, the pending in-memory marker cannot cross the restart; the recovery E2E therefore certifies the resumed provider payload directly.
+- `preserve_compaction` — one self-contained structural audit record per successful preserve checkpoint. It contains checkpoint number/scope, absolute covered user-message ordinals, raw branch entry IDs/boundaries, historical checkpoint IDs/hashes, provider tool names, a per-message index (`role`, semantic kind, source session-entry ID, checkpoint number, estimated tokens, hash), complete token accounting, compression/compacted estimates, and stable-prefix divergence diagnostics. With ordinary `debug: true`, full `contextBefore`/`contextAfter` message bodies are omitted; they are included only in forensic `debugPayloads: true` mode.
+- `post_compaction_context` — the **actual next provider** structural message index and tool names after the checkpoint, plus exact provider-message shared-prefix counts against the previous live request and hashes of checkpoints present in the branch. It deliberately does not duplicate conversation text. If a `length` stop ends that process and the session is resumed later, the pending in-memory marker cannot cross the restart; the recovery E2E therefore certifies the resumed provider payload directly.
 - `provider_request`, `provider_headers`, `provider_response` — request/cache fingerprints and redacted transport diagnostics.
 - `summary_start`, `summary_result`, `summary_retry` — summary lifecycle and the deterministic retry for unusable non-error summary output.
 - `summary_provider_retry_scheduled`, `summary_provider_retry_attempt_start`, `summary_provider_retry_finished` — transient provider retry lifecycle driven by Pi's `settings.retry`.
 
-The debug context contains conversation text and tool-derived state. Treat it as private and do not commit/share it casually.
+Normal debug records can still contain checkpoint summaries and tool-derived metadata, so treat them as private, but they no longer duplicate the full provider conversation. This keeps the 1 MiB rolling log useful for more historical events and makes shared diagnostic logs much smaller.
 
-`debugPayloads: true` still emits `payload_dump` records (`live_before`, `summarization`, `live_after`) for `scripts/compare-dumps.mjs`, but provider tool schemas are replaced by tool names before anything is written. `provider_request` keeps the tool count, names, and a short hash of the full declaration set, so schema changes remain detectable without bloating the log. The canonical compaction audit no longer depends on `debugPayloads`.
+`debugPayloads: true` is the explicit forensic mode for full message payloads. It emits `payload_dump` records (`live_before`, `summarization`, `live_after`) for `scripts/compare-dumps.mjs`; provider tool schemas are replaced by tool names before anything is written. In that mode `preserve_compaction` also includes full predicted `contextBefore`/`contextAfter`. `provider_request` keeps the tool count, names, and a short hash of the full declaration set, so schema changes remain detectable without bloating ordinary logs.
 
 ## Token accounting
 
@@ -182,7 +184,7 @@ Preserve-mode accounting separates:
 - historical checkpoint tokens + count;
 - total raw technical state before checkpointing, including tool calls/results/reasoning/other;
 - the older raw portion actually compacted and the newest raw tail intentionally kept;
-- new checkpoint size, remaining raw technical state, estimated context after, reclaimed tokens and compression.
+- new checkpoint size, remaining raw technical state, estimated context after, compacted raw tokens and compression.
 
 Historical checkpoints are preserved tokens; they are never counted as raw state to compact again.
 

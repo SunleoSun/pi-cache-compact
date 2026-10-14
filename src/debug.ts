@@ -199,7 +199,7 @@ function boundedAppend(file: string, line: string): void {
   writeFileSync(file, `${prefix}${addition}`)
 }
 
-/** Human stderr diagnostics plus a bounded structured JSONL file. */
+/** Human stderr diagnostics for non-interactive runs plus bounded structured JSONL. */
 export class DebugLogger {
   readonly enabled: boolean
   readonly file?: string
@@ -210,7 +210,7 @@ export class DebugLogger {
   }
 
   log(message: string, extra: Record<string, unknown> = {}): void {
-    if (!this.enabled) return
+    if (!this.enabled || process.stderr.isTTY) return
     try {
       process.stderr.write(`[cache-compact] ${message} ${JSON.stringify(extra)}\n`)
     } catch {

@@ -310,9 +310,9 @@ export type SummaryRequestShape =
 | "continuation"
 | "continuation-request"
 | "dropped"
-| "recovery-rewind"
+| "delta-only"
 
-export const PRESERVE_RECOVERY_SYSTEM_PROMPT =
+export const PRESERVE_DELTA_ONLY_SYSTEM_PROMPT =
 "Summarize the supplied technical context. Follow the final user instruction exactly."
 
 // No independent automatic-summary minimum: reserveTokens is the policy.
@@ -346,24 +346,26 @@ export type SummaryRequestPlan = {
  * Decide the summarization request in one place, so the ask hash the
  * `before_provider_request` fallback matches is the ask that is actually sent.
  *
- * Three shapes, tried in order of how much of the live conversation they carry:
+ * Four shapes, ordered by cache reuse and mode:
  *
  * 1. `continuation` — the whole projection. Extends the checkpoint the server
- *    holds *including* the reply it generated, so it is the safest bet for
- *    cache reuse, and the largest: a big tool result appended after the last
- *    request can push it past the context window on its own.
+ * holds *including* the reply it generated, so it is the safest bet for
+ * cache reuse, and the largest: a big tool result appended after the last
+ * request can push it past the context window on its own.
  * 2. `continuation-request` — the messages of the last live request. The server
- *    evaluated exactly these tokens, so appending the ask is still a strict
- *    forward continuation, without the (possibly huge) messages that arrived
- *    after it. This is the shape that fits when a 100 KB tool result just
- *    pushed the conversation over the compaction threshold.
- * 3. `dropped` — the span compaction discards. A rewind: on an append-only
- *    cache it re-prefills everything. Last resort, and the only shape used when
- *    `continuation: false`.
+ * evaluated exactly these tokens, so appending the ask is still a strict
+ * forward continuation, without the (possibly huge) messages that arrived
+ * after it.
+ * 3. `delta-only` — preserve-mode safety path containing only the compactable
+ * technical delta plus a tiny system instruction and the checkpoint ask. It is
+ * cold by design and is used only when a cache-friendly preserve request cannot
+ * fit safely or when a cached summary itself exhausts its output budget.
+ * 4. `dropped` — legacy non-preserve rewind over Pi's dropped span. It is used
+ * when `continuation: false` or when legacy rewind fallback is enabled.
  *
- * The first shape that fits wins; if none fits, the first is used anyway (the
- * request is going to be rejected either way, and Pi's own fallback summary is
- * larger still). `dropped` is only chosen when it is the shape that fits.
+ * The first eligible shape that fits wins. Preserve mode prefers cache-friendly
+ * continuation shapes and then delta-only; non-preserve mode keeps the legacy
+ * continuation/dropped behavior.
  *
  * Messages arrive already converted because `convertToLlm` is a runtime import
  * and this module stays pure (type-only SDK imports).
@@ -396,8 +398,8 @@ export function planSummaryRequest(args: {
   modelMaxTokens?: number
   /** Absolute user-message ordinals covered by this preserve delta. */
   preserveUserMessageOrdinals?: readonly number[]
-  /** Permit a cold, minimal dropped-delta request when a preserve continuation cannot fit. */
-  allowPreserveRewind?: boolean
+  /** Prefer a delta-only request after a cache-friendly summary exhausts its output budget. */
+  preferDeltaOnly?: boolean
   }): SummaryRequestPlan {
   // Resolve the output ceiling once from the active mode's policy so every fit
   // check and the actual request use the same ceiling.
@@ -428,19 +430,19 @@ export function planSummaryRequest(args: {
   reportedPrefixTokens?: number
   }
   const outputBudget = (candidate: SummaryCandidate): number | undefined => {
-  const coldRecovery = candidate.shape === "recovery-rewind"
-  return continuationOutputBudget({
-  contextWindow: args.contextWindow,
-  messages: candidate.messages,
-  // A recovery rewind is a brand-new prompt. Historical provider calibration
-  // describes a different, much larger prefix and must not inflate this delta.
-  scale: coldRecovery ? 1 : scale,
-  ask: fitAsk,
-  ignoreReportedUsage: coldRecovery,
-  ...(candidate.reportedPrefixTokens === undefined
-  ? {}
-  : { reportedPrefixTokens: candidate.reportedPrefixTokens }),
-  })
+    const deltaOnly = candidate.shape === "delta-only"
+    return continuationOutputBudget({
+      contextWindow: args.contextWindow,
+      messages: candidate.messages,
+      // A delta-only summary is a brand-new prompt. Historical provider calibration
+      // describes a different, much larger prefix and must not inflate this delta.
+      scale: deltaOnly ? 1 : scale,
+      ask: fitAsk,
+      ignoreReportedUsage: deltaOnly,
+      ...(candidate.reportedPrefixTokens === undefined
+        ? {}
+        : { reportedPrefixTokens: candidate.reportedPrefixTokens }),
+    })
   }
   const fits = (candidate: SummaryCandidate): boolean => {
     if (args.options.preserveDialogue === true) {
@@ -465,30 +467,33 @@ export function planSummaryRequest(args: {
   const requiredRequestCount = Math.max(0, args.liveMessages.length - keptCount)
   const candidates: SummaryCandidate[] = []
   if (args.options.preserveDialogue === true) {
-  const usePreviousProviderPrefix =
-  args.requestMessages.length >= requiredRequestCount &&
-  args.requestMessages.length > 0 &&
-  args.requestMessages.length < args.liveMessages.length
-  candidates.push({
-  shape: usePreviousProviderPrefix ? "continuation-request" : "continuation",
-  messages: usePreviousProviderPrefix ? args.requestMessages : args.liveMessages,
-  ...(usePreviousProviderPrefix && args.requestPromptTokens !== undefined
-  ? { reportedPrefixTokens: args.requestPromptTokens }
-  : {}),
-  })
-  if (args.allowPreserveRewind === true) {
-  candidates.push({
-  shape: "recovery-rewind",
-  messages: [
-  {
-  role: "system",
-  content: PRESERVE_RECOVERY_SYSTEM_PROMPT,
-  timestamp: 0,
-  } as Message,
-  ...args.droppedMessages,
-  ],
-  })
-  }
+    const usePreviousProviderPrefix =
+      args.requestMessages.length >= requiredRequestCount &&
+      args.requestMessages.length > 0 &&
+      args.requestMessages.length < args.liveMessages.length
+    const continuationCandidate: SummaryCandidate = {
+      shape: usePreviousProviderPrefix ? "continuation-request" : "continuation",
+      messages: usePreviousProviderPrefix ? args.requestMessages : args.liveMessages,
+      ...(usePreviousProviderPrefix && args.requestPromptTokens !== undefined
+        ? { reportedPrefixTokens: args.requestPromptTokens }
+        : {}),
+    }
+    const deltaOnlyCandidate: SummaryCandidate = {
+      shape: "delta-only",
+      messages: [
+        {
+          role: "system",
+          content: PRESERVE_DELTA_ONLY_SYSTEM_PROMPT,
+          timestamp: 0,
+        } as Message,
+        ...args.droppedMessages,
+      ],
+    }
+    if (args.preferDeltaOnly === true) {
+      candidates.push(deltaOnlyCandidate)
+    } else {
+      candidates.push(continuationCandidate, deltaOnlyCandidate)
+    }
   } else {
     if (args.options.continuation !== false) {
       if (args.liveMessages.length > droppedCount) {
@@ -675,7 +680,7 @@ function estimatedTokens(value: unknown): number {
  * messages ourselves, so their ratio calibrates every estimate we make on the
  * same conversation. `bytes / 3` is deliberately pessimistic and blob-heavy
  * transcripts came out ~3x high; a raw estimate that far off makes the fit
- * check refuse shapes that would have fit, and makes the reclaimed-size ceiling
+ * check refuse shapes that would have fit, and makes the compacted-state ceiling
  * inert. Clamped, because a bad ratio is worse than none: it is only ever a
  * correction to an estimate that has to stay in the same ballpark.
  */
@@ -896,7 +901,7 @@ export function summaryRejection(response: SummaryCheck): string | undefined {
     return "the summary hit the token cap and is incomplete"
   }
   if (response.content.some((block) => block.type === "toolCall")) {
-    return "the model tried to call a tool instead of writing the summary"
+    return PARSED_TOOL_CALL_REPLY
   }
   if (!extractSummaryText(response.content)) {
     return NO_TEXT_REPLY
@@ -937,16 +942,16 @@ export function looksLikeToolCall(text: string): boolean {
 }
 
 /**
- * The one rejection worth retrying: the model finished normally but never wrote
- * anything in the text channel (it spent the turn reasoning and stopped). Other
- * rejections — a token cap, a tool call, an error, an abort — repeat
- * deterministically, but an empty answer often comes back fine on a second
- * sample, and on a cache hit that retry costs seconds.
+ * Empty, parsed-tool-call, and textual-tool-call replies are worth one deterministic
+ * text-only retry. Token-cap/error/abort responses need a different recovery path.
  */
 export const NO_TEXT_REPLY = "the model returned no summary text"
 
+/** A parsed provider tool call rather than summary text. */
+export const PARSED_TOOL_CALL_REPLY = "the model tried to call a tool instead of writing the summary"
+
 /** The reply was tool-call syntax rather than a summary. Retried once: the nudge
- *  tells the model to stay in text, and a cache hit makes the retry cheap. */
+ * tells the model to stay in text, and a cache hit makes the retry cheap. */
 export const TOOL_CALL_TEXT_REPLY = "the model replied with a tool call instead of a summary"
 
 /**
@@ -990,6 +995,38 @@ export function resolveSummaryReasoningEffort(
   // model means thinking stays on); "none" is a value the server understands as
   // "do not reason", and is deliberately *not* handed to the chat template.
   if (configured === "off") return undefined
+  if (configured) return configured
+  return observed ?? undefined
+}
+
+/**
+ * Tool choice from the last live provider payload. Null means the live request
+ * omitted the field, which is a distinct cache variant we must reproduce.
+ * Undefined means the payload was not observable or used a tool-choice shape
+ * this extension cannot represent through pi-ai's summary options.
+ */
+export type LiveToolChoice = "auto" | "none" | null
+
+export function extractLiveToolChoice(payload: unknown): LiveToolChoice | undefined {
+  if (typeof payload !== "object" || payload === null) return undefined
+  const record = payload as Record<string, unknown>
+  const value = record.tool_choice ?? record.tools_choice
+  if (value === undefined) return null
+  return value === "auto" || value === "none" ? value : undefined
+}
+
+/**
+ * Summary tool choice: an explicit config override wins for normal requests;
+ * otherwise cache-friendly summaries mirror the last live payload exactly.
+ * Delta-only and semantic text-only retries can force tools off because they do
+ * not benefit from preserving the old live request's cache identity.
+ */
+export function resolveSummaryToolChoice(
+  configured: "auto" | "none" | undefined,
+  observed: LiveToolChoice | undefined,
+  forceNone = false,
+): "auto" | "none" | undefined {
+  if (forceNone) return "none"
   if (configured) return configured
   return observed ?? undefined
 }

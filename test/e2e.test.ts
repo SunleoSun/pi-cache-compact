@@ -25,7 +25,7 @@ import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
 import { rollingMessageHashes, sharedPrefixLength } from "../src/debug.ts"
-import { PRESERVE_RECOVERY_SYSTEM_PROMPT } from "../src/build.ts"
+import { PRESERVE_DELTA_ONLY_SYSTEM_PROMPT } from "../src/build.ts"
 
 const enabled =
   process.env.PI_CACHE_COMPACT_E2E === "1" ||
@@ -64,11 +64,14 @@ promptTokens = 910,
 options: {
 lengthOnceWhen?: (body: any, requestIndex: number) => boolean
 lengthPromptTokens?: number
+summaryLengthOnceWhen?: (body: any, requestIndex: number) => boolean
+summaryLengthPromptTokens?: number
 } = {},
 ) {
 const requests: Recorded[] = []
 let toolCalls = 0
 let lengthResponses = 0
+let summaryLengthResponses = 0
 
   const server = http.createServer((req, res) => {
     let raw = ""
@@ -111,14 +114,22 @@ let lengthResponses = 0
       lengthResponses === 0 &&
       options.lengthOnceWhen?.(body, requestIndex) === true
       if (shouldLength) lengthResponses += 1
+      const shouldSummaryLength =
+      isSummary &&
+      summaryLengthResponses === 0 &&
+      options.summaryLengthOnceWhen?.(body, requestIndex) === true
+      if (shouldSummaryLength) summaryLengthResponses += 1
+      const truncated = shouldLength || shouldSummaryLength
       const effectivePromptTokens =
       shouldLength && options.lengthPromptTokens !== undefined
       ? options.lengthPromptTokens
+      : shouldSummaryLength && options.summaryLengthPromptTokens !== undefined
+      ? options.summaryLengthPromptTokens
       : promptTokens
       const usage = {
       prompt_tokens: effectivePromptTokens,
-      completion_tokens: shouldLength ? 1 : 10,
-      total_tokens: effectivePromptTokens + (shouldLength ? 1 : 10),
+      completion_tokens: truncated ? 1 : 10,
+      total_tokens: effectivePromptTokens + (truncated ? 1 : 10),
       }
       const toolCallId = `call_${toolCalls + 1}`
       const summaryText = `${SUMMARY_TEXT} #${toolCalls}`
@@ -135,7 +146,9 @@ let lengthResponses = 0
 
       if (body.stream === false) {
       res.writeHead(200, { "content-type": "application/json" })
-      const message = isSummary
+      const message = shouldSummaryLength
+      ? { role: "assistant", content: "PARTIAL SUMMARY" }
+      : isSummary
       ? { role: "assistant", content: summaryText }
       : shouldLength
       ? { role: "assistant", content: "I" }
@@ -162,7 +175,7 @@ let lengthResponses = 0
       {
       index: 0,
       message,
-      finish_reason: shouldLength ? "length" : wantsTool ? "tool_calls" : "stop",
+      finish_reason: truncated ? "length" : wantsTool ? "tool_calls" : "stop",
       },
       ],
       usage,
@@ -177,10 +190,19 @@ let lengthResponses = 0
         connection: "keep-alive",
       })
 
-      if (shouldLength) {
+      if (truncated) {
       res.write(
       sse(
-      chunk([{ index: 0, delta: { role: "assistant", content: "I" }, finish_reason: null }]),
+      chunk([
+      {
+      index: 0,
+      delta: {
+      role: "assistant",
+      content: shouldSummaryLength ? "PARTIAL SUMMARY" : "I",
+      },
+      finish_reason: null,
+      },
+      ]),
       ),
       )
       res.write(sse(chunk([{ index: 0, delta: {}, finish_reason: "length" }], { usage })))
@@ -637,7 +659,7 @@ test(
 )
 
 test(
-"certification: preserve recovery rewind keeps the exact technical delta and rebuilds the next live context",
+"certification: delta-only summary keeps the exact technical delta and rebuilds the next live context",
 { skip: enabled ? false : "set PI_CACHE_COMPACT_E2E=1 to run (spawns pi)", timeout: 180_000 },
 async () => {
 const firstOutput = "FIRST RECOVERY-CERT TOOL OUTPUT\n"
@@ -719,7 +741,7 @@ assert.ok(preRecoveryLive, `no oversized live request before recovery\n${context
 
 // Checkpoint #1 remains the normal cache-friendly path: it summarizes the old
 // batch and deliberately leaves the second batch raw.
-assert.notEqual(textOf(firstSummaryReq.body.messages?.[0]?.content), PRESERVE_RECOVERY_SYSTEM_PROMPT)
+assert.notEqual(textOf(firstSummaryReq.body.messages?.[0]?.content), PRESERVE_DELTA_ONLY_SYSTEM_PROMPT)
 assert.ok(JSON.stringify(firstSummaryReq.body.messages).includes("FIRST RECOVERY-CERT TOOL OUTPUT"))
 assert.ok(!JSON.stringify(firstSummaryReq.body.messages).includes("RECOVERY TOOL OUTPUT"))
 assert.deepEqual(
@@ -734,9 +756,9 @@ assert.ok(preRecoverySerialized.includes("## Tool Context Checkpoint #1"))
 assert.ok(preRecoverySerialized.includes("RECOVERY TOOL OUTPUT"))
 assert.ok(preRecoverySerialized.includes("call_2"))
 
-// Recovery is intentionally cold and minimal: only a tiny recovery system
+// Delta-only summarization is intentionally minimal: only a tiny summary system
 // message, the exact technical delta, and the synthetic checkpoint ask.
-assert.equal(textOf(recoveryReq.body.messages?.[0]?.content), PRESERVE_RECOVERY_SYSTEM_PROMPT)
+assert.equal(textOf(recoveryReq.body.messages?.[0]?.content), PRESERVE_DELTA_ONLY_SYSTEM_PROMPT)
 const recoveryRoles = recoveryReq.body.messages.map((message: any) => message.role)
 assert.ok(
 recoveryRoles[0] === "system" || recoveryRoles[0] === "developer",
@@ -854,7 +876,7 @@ assert.ok(sessionText.includes("call_2"))
 assert.ok(sessionText.includes("cache-compact-preserve-checkpoint"))
 assert.doesNotMatch(sessionText, /"type":"compaction"/)
 
-// Debug audit certifies the branch actually used recovery-rewind and that the
+// Debug audit certifies the branch actually used delta-only and that the
 // first live payload after CP2 is the context Pi really sent to the provider.
 const debugRecords = fs
 .readFileSync(debugFile, "utf8")
@@ -863,8 +885,8 @@ const debugRecords = fs
 .map((line) => JSON.parse(line) as any)
 const summaryStarts = debugRecords.filter((record) => record.kind === "summary_start")
 assert.equal(summaryStarts.length, 2)
-assert.notEqual(summaryStarts[0].requestShape, "recovery-rewind")
-assert.equal(summaryStarts[1].requestShape, "recovery-rewind")
+assert.notEqual(summaryStarts[0].requestShape, "delta-only")
+assert.equal(summaryStarts[1].requestShape, "delta-only")
 const compactions = debugRecords.filter((record) => record.kind === "preserve_compaction")
 assert.equal(compactions.length, 2)
 assert.equal(compactions[1].checkpoint.number, 2)
@@ -872,11 +894,139 @@ assert.deepEqual(compactions[1].checkpoint.coveredUserMessages, [2])
 assert.ok(JSON.stringify(compactions[1].contextBefore).includes("RECOVERY TOOL OUTPUT"))
 assert.ok(!JSON.stringify(compactions[1].contextAfter).includes("RECOVERY TOOL OUTPUT"))
 assert.ok(JSON.stringify(compactions[1].contextAfter).includes("I"))
+assert.ok(Array.isArray(compactions[1].contextIndex.before))
+assert.ok(Array.isArray(compactions[1].contextIndex.after))
 // Recovery ends the length-stopped print run, so the next live request is made
 // by the resumed Pi process. The mock capture above is therefore the actual
 // provider-level certification; the in-memory post_compaction_context marker
 // cannot survive that process boundary.
 assert.ok(postMessages.length > 0)
+} finally {
+mock.close()
+run?.cleanup()
+}
+},
+)
+
+test(
+"certification: cache-friendly summary length retries the exact delta only",
+{ skip: enabled ? false : "set PI_CACHE_COMPACT_E2E=1 to run (spawns pi)", timeout: 180_000 },
+async () => {
+const firstOutput = "FIRST FORWARD-LENGTH TOOL OUTPUT\n"
+const recoveryOutput = "FORWARD-LENGTH RECOVERY TOOL OUTPUT\n" + "q".repeat(40_000)
+const mock = await startMockModel(37_000, {
+lengthPromptTokens: 42_268,
+lengthOnceWhen: (body) => {
+const serialized = JSON.stringify(body?.messages ?? [])
+const ask = textOf(lastMessage(body)?.content)
+return (
+serialized.includes("## Tool Context Checkpoint #1") &&
+serialized.includes("FORWARD-LENGTH RECOVERY TOOL OUTPUT") &&
+!/technical checkpoint ONLY from tool activity/i.test(ask) &&
+!/technical tool-context checkpoint/i.test(ask)
+)
+},
+summaryLengthPromptTokens: 42_268,
+summaryLengthOnceWhen: (body) => {
+const messages = body?.messages ?? []
+return (
+JSON.stringify(messages).includes("FORWARD-LENGTH RECOVERY TOOL OUTPUT") &&
+textOf(messages[0]?.content) !== PRESERVE_DELTA_ONLY_SYSTEM_PROMPT
+)
+},
+})
+const debugFile = path.join(
+fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-compact-forward-length-")),
+"debug.jsonl",
+)
+const firstPrompt = `${MARKER} FORWARD-LENGTH USER 1`
+const secondPrompt = `${MARKER} FORWARD-LENGTH USER 2`
+const finalPrompt = "FORWARD-LENGTH FINAL PROBE"
+let run: Awaited<ReturnType<typeof runPi>> | undefined
+try {
+run = await runPi(mock, {
+debugFile,
+thinking: "low",
+preserveDialogue: true,
+contextWindow: 50_000,
+prompt: firstPrompt,
+probeContent: firstOutput,
+})
+const root = run.root
+run = await runPi(mock, {
+debugFile,
+thinking: "low",
+preserveDialogue: true,
+contextWindow: 50_000,
+root,
+prompt: secondPrompt,
+probeContent: recoveryOutput,
+})
+const recoveryRun = run
+run = await runPi(mock, {
+debugFile,
+thinking: "low",
+preserveDialogue: true,
+contextWindow: 50_000,
+root,
+prompt: finalPrompt,
+})
+
+const isToolSummaryRequest = (request: Recorded): boolean => {
+const ask = textOf(lastMessage(request.body)?.content)
+return (
+/technical checkpoint ONLY from tool activity/i.test(ask) ||
+/technical tool-context checkpoint/i.test(ask)
+)
+}
+const summaries = mock.requests.filter(isToolSummaryRequest)
+assert.equal(summaries.length, 3, `expected CP1 + cached CP2 attempt + delta-only CP2 retry\n${dump(mock.requests)}`)
+const forward = summaries[1]
+const cold = summaries[2]
+assert.notEqual(textOf(forward.body.messages?.[0]?.content), PRESERVE_DELTA_ONLY_SYSTEM_PROMPT)
+assert.ok(JSON.stringify(forward.body.messages).includes("## Tool Context Checkpoint #1"))
+assert.ok(JSON.stringify(forward.body.messages).includes("FORWARD-LENGTH RECOVERY TOOL OUTPUT"))
+assert.equal(textOf(cold.body.messages?.[0]?.content), PRESERVE_DELTA_ONLY_SYSTEM_PROMPT)
+assert.ok(JSON.stringify(cold.body.messages).includes("FORWARD-LENGTH RECOVERY TOOL OUTPUT"))
+assert.ok(!JSON.stringify(cold.body.messages).includes("## Tool Context Checkpoint #1"))
+assert.ok(!JSON.stringify(cold.body.messages).includes(firstPrompt))
+assert.ok(!JSON.stringify(cold.body.messages).includes(secondPrompt))
+
+const records = fs
+.readFileSync(debugFile, "utf8")
+.split("\n")
+.filter(Boolean)
+.map((line) => JSON.parse(line) as any)
+const recoveryStart = records.find((record) => record.kind === "summary_delta_only_retry_start")
+const recoveryResult = records.find((record) => record.kind === "summary_delta_only_retry_result")
+assert.ok(recoveryStart, "cache-friendly summary length did not start delta-only retry")
+assert.equal(recoveryStart.forwardShape, "continuation-request")
+assert.equal(recoveryStart.requestShape, "delta-only")
+assert.equal(recoveryStart.requestFits, true)
+assert.ok(recoveryResult, "delta-only retry result was not logged")
+assert.equal(recoveryResult.stopReason, "stop")
+assert.equal(recoveryResult.reason, undefined)
+
+const checkpoints = records.filter((record) => record.kind === "preserve_compaction")
+assert.equal(checkpoints.length, 2)
+assert.equal(checkpoints[1].checkpoint.number, 2)
+assert.ok(!JSON.stringify(checkpoints[1].contextAfter).includes("FORWARD-LENGTH RECOVERY TOOL OUTPUT"))
+assert.ok(Array.isArray(checkpoints[1].contextIndex.after))
+
+assert.equal(run.code, 0, `recovery=${recoveryRun.code}, final=${run.code}\n${run.stderr}`)
+const finalLive = [...mock.requests]
+.reverse()
+.find(
+(request) =>
+lastMessage(request.body)?.role === "user" &&
+textOf(lastMessage(request.body)?.content) === finalPrompt,
+)
+assert.ok(finalLive, "no final ordinary provider request after forward-length recovery")
+const finalSerialized = JSON.stringify(finalLive.body.messages)
+assert.ok(finalSerialized.includes("## Tool Context Checkpoint #1"))
+assert.ok(finalSerialized.includes("## Tool Context Checkpoint #2"))
+assert.ok(!finalSerialized.includes("FORWARD-LENGTH RECOVERY TOOL OUTPUT"))
+assert.match(run.stdout, /done/i)
 } finally {
 mock.close()
 run?.cleanup()
@@ -1096,14 +1246,24 @@ test(
         compactionRecords[0].checkpoint.summaryHash,
       )
       assert.equal(
-        JSON.stringify(compactionRecords[1].contextAfter).split(SUMMARY_TEXT).length - 1,
-        2,
+      JSON.stringify(compactionRecords[1].contextAfter).split(SUMMARY_TEXT).length - 1,
+      2,
       )
       assert.ok(JSON.stringify(compactionRecords[1].contextBefore).includes("SECOND TOOL OUTPUT"))
       assert.ok(!JSON.stringify(compactionRecords[1].contextAfter).includes("SECOND TOOL OUTPUT"))
       assert.ok(JSON.stringify(compactionRecords[1].contextAfter).includes("THIRD TOOL OUTPUT"))
       assert.ok(Array.isArray(compactionRecords[1].contextIndex.before))
       assert.ok(Array.isArray(compactionRecords[1].contextIndex.after))
+      assert.ok(
+      compactionRecords[1].contextIndex.after.some(
+      (entry: any) => entry.checkpointNumber === 1,
+      ),
+      )
+      assert.ok(
+      compactionRecords[1].contextIndex.after.some(
+      (entry: any) => entry.checkpointNumber === 2,
+      ),
+      )
       assert.ok(compactionRecords[1].scope.rawEntryCount > 0)
       assert.equal(
         compactionRecords[1].scope.rawEntryIds.length,
@@ -1116,11 +1276,8 @@ test(
       assert.ok(compactionRecords[1].tokens.compactedRaw > 0)
       assert.ok(compactionRecords[1].tokens.remainingRawCompactable > 0)
       assert.equal(
-        compactionRecords[1].tokens.estimatedReclaimed,
-        Math.max(
-          0,
-          compactionRecords[1].tokens.compactedRaw - compactionRecords[1].tokens.newCheckpoint,
-        ),
+      compactionRecords[1].tokens.estimatedCompactedRaw,
+      compactionRecords[1].tokens.compactedRaw,
       )
       assert.equal(
         compactionRecords[1].tokens.compression,
@@ -1134,6 +1291,8 @@ test(
       )
       assert.ok(postContexts.length >= 2)
       assert.equal(postContexts.at(-1).branchCheckpoints.length, 2)
+      assert.equal(postContexts.at(-1).context.messages, undefined)
+      assert.ok(Array.isArray(postContexts.at(-1).context.messageIndex))
     } finally {
       mock.close()
       run?.cleanup()

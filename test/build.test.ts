@@ -8,6 +8,7 @@ import {
   computeFileListsFromMessages,
   continuationFits,
   extractLiveReasoningEffort,
+extractLiveToolChoice,
   extractSummaryText,
   estimateMessagesTokens,
   formatFileOperations,
@@ -23,11 +24,12 @@ import {
   messageSnippet,
   messagesBeforeEntry,
   planSummaryRequest,
-  PRESERVE_RECOVERY_SYSTEM_PROMPT,
+  PRESERVE_DELTA_ONLY_SYSTEM_PROMPT,
   promptTokensOf,
   renderSummaryAsk,
   replayableHeaders,
   resolveSummaryReasoningEffort,
+resolveSummaryToolChoice,
   summaryRejection,
 } from "../src/build.ts"
 
@@ -432,7 +434,7 @@ test("planSummaryRequest does not use a cached request that stops before a resto
   assert.notEqual(plan.shape, "continuation-request")
 })
 
-test("preserve summary output is bounded by reserve/model, not reclaimed-state size", () => {
+test("preserve summary output is bounded by reserve/model, not compacted-state size", () => {
   const preservedDialogue = { role: "user", content: "x".repeat(200_000) } as any
   const compactableToolState = {
     role: "toolResult",
@@ -526,7 +528,7 @@ test("preserve planning trusts the exact previous provider-prefix token count", 
   assert.deepEqual(plan.messages, prefix)
 })
 
-test("preserve recovery rewind ignores stale usage from the original live prefix", () => {
+test("delta-only summary ignores stale usage from the original live prefix", () => {
 const rawDelta: any[] = [
 {
 role: "assistant",
@@ -564,17 +566,42 @@ contextWindow: 50_000,
 reserveTokens: preserveReserveTokens(50_000),
 modelMaxTokens: 512,
 preserveUserMessageOrdinals: [2],
-allowPreserveRewind: true,
+// delta-only fallback is automatic in preserve mode
 })
 
-assert.equal(plan.shape, "recovery-rewind")
+assert.equal(plan.shape, "delta-only")
 assert.equal(plan.requestFits, true)
 assert.ok(plan.maxTokens > 0)
 assert.equal(plan.messages[0].role, "system")
-assert.equal((plan.messages[0] as any).content, PRESERVE_RECOVERY_SYSTEM_PROMPT)
+assert.equal((plan.messages[0] as any).content, PRESERVE_DELTA_ONLY_SYSTEM_PROMPT)
 assert.equal(plan.messages.length, rawDelta.length + 1)
 assert.ok(JSON.stringify(plan.messages).includes("RECOVERY TOOL OUTPUT"))
 assert.ok(!JSON.stringify(plan.messages).includes("PERMANENT DIALOGUE"))
+})
+test("preferDeltaOnly selects the delta-only candidate", () => {
+const delta: any[] = [{ role: "toolResult", content: [{ type: "text", text: "R".repeat(12_000) }] }]
+const live: any[] = [
+{ role: "system", content: "SYS" },
+{ role: "user", content: "KEEP" },
+...delta,
+{ role: "assistant", content: [{ type: "text", text: "The" }], stopReason: "length" },
+]
+const plan = planSummaryRequest({
+liveMessages: live,
+requestMessages: live.slice(0, -1),
+requestPromptTokens: 45_956,
+droppedMessages: delta,
+keptCount: 1,
+options: { preserveDialogue: true },
+contextWindow: 50_000,
+reserveTokens: preserveReserveTokens(50_000),
+modelMaxTokens: 32_000,
+// delta-only fallback is automatic in preserve mode
+preferDeltaOnly: true,
+})
+assert.equal(plan.shape, "delta-only")
+assert.equal(plan.requestFits, true)
+assert.ok(plan.maxTokens > 1)
 })
 
 test("planSummaryRequest continues the last live request when the projection is too big", () => {
@@ -680,6 +707,17 @@ test('resolveSummaryReasoningEffort treats "off" as omitting the field', () => {
   assert.equal(resolveSummaryReasoningEffort(undefined, null), undefined)
 })
 
+test("summary tool choice mirrors the live cache variant unless text-only is required", () => {
+assert.equal(extractLiveToolChoice({ model: "m" }), null)
+assert.equal(extractLiveToolChoice({ tool_choice: "auto" }), "auto")
+assert.equal(extractLiveToolChoice({ tools_choice: "none" }), "none")
+assert.equal(extractLiveToolChoice({ tool_choice: { type: "function" } }), undefined)
+assert.equal(resolveSummaryToolChoice(undefined, null), undefined)
+assert.equal(resolveSummaryToolChoice(undefined, "auto"), "auto")
+assert.equal(resolveSummaryToolChoice("none", "auto"), "none")
+assert.equal(resolveSummaryToolChoice("auto", null, true), "none")
+})
+
 test("the default ask gives an explicit skeleton and a starting point", () => {
   // Pi's compaction prompt hands the model a literal format ("Use this EXACT
   // format: ## Goal ..."), which is the believable reason its summaries always
@@ -691,9 +729,8 @@ test("the default ask gives an explicit skeleton and a starting point", () => {
   assert.match(ask, /Use this EXACT format:/)
   assert.match(ask, /^## Goal$/m)
   assert.match(ask, /^## Next Steps$/m)
-  // Pi's prompt does not forbid tool calls in words — it relies on rejecting a
-  // tool-call reply, and this extension also asks the provider for
-  // `tool_choice: "none"` because the tools must stay declared for the cache.
+  // Pi's prompt does not forbid tool calls in words. Cache-friendly summaries
+  // mirror the live request's tool-choice variant; a semantic retry forces tools off.
 })
 
 test("renderSummaryAsk mirrors Pi's split-turn artifact", () => {

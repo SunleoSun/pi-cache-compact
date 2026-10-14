@@ -69,10 +69,10 @@ export interface CacheCompactOptions {
    */
   cacheRetention?: CacheRetention
   /**
-   * Whether the summary request advertises tools. "none" (default) asks the
-   * provider to forbid tool calls; the tools are still declared so the prompt
-   * prefix matches the conversation.
-   */
+  * Optional summary tool-choice override. When omitted, cache-friendly summaries
+  * mirror the last live provider request exactly, including omission of the field.
+  * Recovery requests use the text-only setting by default.
+  */
   toolChoice?: "none" | "auto"
   /**
    * Whether the summarization *request* is a strict forward continuation of the
@@ -92,11 +92,11 @@ export interface CacheCompactOptions {
    */
   continuation?: boolean
   /**
-   * Try the rewinding shape when no continuation fits instead of leaving that
-   * compaction to Pi. Default false because rewinds lose append-only cache reuse.
-   * Preserve mode has one independent recovery exception: after a `length` turn
-   * whose already-sent provider prefix is too large, it may cold-summarize only
-   * the technical delta so the session can recover.
+   * Legacy/non-preserve control: try the dropped-span request when no continuation
+   * fits instead of leaving that compaction to Pi. Default false because that shape
+   * loses append-only cache reuse. Preserve mode does not use this gate: it
+   * automatically switches to a delta-only summary when the cached shape cannot
+   * fit safely or when a cached summary itself stops at `length`.
    */
   rewindWhenNeeded?: boolean
   /** Master debug switch. Default false; when false, debugFile is never created or touched. */

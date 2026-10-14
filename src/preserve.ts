@@ -391,6 +391,48 @@ export function preserveDialogueDeltaMessages(
     )
 }
 
+/**
+ * Safe boundaries for carrying the newest part of an oversized technical delta
+ * forward as raw state. A boundary is always before a user/assistant message,
+ * never before a tool result, so an assistant tool-call batch stays with its
+ * following results. Returned IDs are in branch order.
+ */
+export function preserveDeltaTailCandidates(
+  branchEntries: readonly SessionEntry[],
+  endExclusiveEntryId?: string,
+): string[] {
+  const edits = latestEdits(branchEntries)
+  const start = preserveDeltaStartIndex(branchEntries)
+  const end = entryIndexOrEnd(branchEntries, endExclusiveEntryId)
+  const candidates: string[] = []
+  let rawSeen = false
+
+  for (let index = start; index < end; index += 1) {
+    const entry = branchEntries[index]
+    if (entry?.type !== "message") continue
+    const edited = applyEdit(entry.message, edits.get(entry.id))
+    if (!edited) continue
+
+    if (rawSeen && (edited.role === "user" || edited.role === "assistant")) {
+      candidates.push(entry.id)
+    }
+
+    if (edited.role === "toolResult") {
+      rawSeen = true
+      continue
+    }
+    if (edited.role === "assistant") {
+      const content = Array.isArray(edited.content) ? edited.content : []
+      const completedReply = preservedDialogueMessage(entry, edits.get(entry.id))
+      if (completedReply === undefined || content.some((block) => block.type !== "text")) {
+        rawSeen = true
+      }
+    }
+  }
+
+  return candidates
+}
+
 export type PreserveDeltaScope = {
   checkpointCount: number
   nextCheckpointNumber: number

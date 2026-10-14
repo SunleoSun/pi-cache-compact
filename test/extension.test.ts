@@ -261,7 +261,7 @@ test("writes a summary as a forward continuation of the live conversation", asyn
     assert.match(askText, /1 later message\(s\) stay in the context verbatim/)
     assert.match(askText, /assistant message that begins/)
     assert.match(askText, /"hi"/)
-    assert.equal(options.toolChoice, "none")
+    assert.ok(!("toolChoice" in options))
     assert.equal(options.cacheRetention, "short")
   } finally {
     ws.cleanup()
@@ -628,16 +628,16 @@ timestamp: 3,
 }
 const currentAssistant = {
 ...assistant(
-[{ type: "thinking", thinking: "CURRENT TRUNCATED REASONING" }] as any,
+[{ type: "text", text: "CURRENT TRUNCATED TEXT" }] as any,
 "length",
 ),
 usage: {
-input: 56_172,
+input: 30_000,
 output: 1,
 cacheRead: 0,
 cacheWrite: 0,
 reasoning: 1,
-totalTokens: 56_173,
+totalTokens: 30_001,
 cost: {},
 },
 }
@@ -651,6 +651,7 @@ message: { role: "user", content: "PERMANENT USER REQUIREMENT", timestamp: 1 },
 { type: "message", id: "t-old", message: oldResult },
 { type: "message", id: "a-current", message: currentAssistant },
 ]
+let responseIndex = 0
 const { handlers, ctx, calls } = setup({
 cwd: ws.cwd,
 branchEntries,
@@ -661,10 +662,29 @@ oldAssistant,
 oldResult,
 currentAssistant,
 ],
-contextUsage: { tokens: 56_173, contextWindow: 50_000, percent: 112.346 },
+contextUsage: { tokens: 42_269, contextWindow: 50_000, percent: 84.538 },
 model: { provider: "mock", id: "test-model", contextWindow: 50_000 },
 hasUI: true,
+response: async () =>
+responseIndex++ === 0
+? assistant([{ type: "text", text: "PARTIAL FORWARD SUMMARY" }] as any, "length")
+: assistant([{ type: "text", text: "RECOVERED SUMMARY" }] as any),
 })
+handlers.get("before_provider_request")!(
+{
+type: "before_provider_request",
+payload: {
+model: "test-model",
+messages: [
+{ role: "system", content: "SYSTEM PROMPT" },
+branchEntries[0].message,
+oldAssistant,
+oldResult,
+],
+},
+},
+ctx,
+)
 
 const result = await handlers.get("turn_end")!(
 {
@@ -680,12 +700,19 @@ continue: false,
 ctx,
 )
 
-assert.equal(calls.complete.length, 1)
-const summaryRequest = JSON.stringify(calls.complete[0].context.messages)
+assert.equal(calls.complete.length, 2)
+const forwardRequest = JSON.stringify(calls.complete[0].context.messages)
+const summaryRequest = JSON.stringify(calls.complete[1].context.messages)
+assert.match(forwardRequest, /PERMANENT USER REQUIREMENT/)
 assert.match(summaryRequest, /CARRIED RAW RESULT/)
-assert.doesNotMatch(summaryRequest, /CURRENT TRUNCATED REASONING/)
+assert.doesNotMatch(summaryRequest, /CURRENT TRUNCATED TEXT/)
+// This synthetic first-checkpoint fixture has no historical checkpoint boundary,
+// so the owning user anchor is part of the exact delta. The real recovery E2E
+// below certifies that post-checkpoint recovery excludes preserved dialogue.
+assert.match(summaryRequest, /PERMANENT USER REQUIREMENT/)
 assert.match(summaryRequest, /Summarize the supplied technical context/)
-assert.equal(calls.complete[0].context.messages[0].role, "system")
+assert.equal(calls.complete[1].context.messages[0].role, "system")
+assert.ok(calls.complete[1].options.maxTokens > 0)
 assert.ok(
 result.entries.some(
 (entry: any) => entry.type === "context_edit" && entry.targetId === "t-old",
@@ -707,8 +734,322 @@ ws.cleanup()
 }
 })
 
+test("tool-bearing turn retries a truncated cached summary with delta-only", async () => {
+const ws = tempWorkspace({ preserveDialogue: true })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const oldAssistant = assistant(
+[
+{ type: "text", text: "OLD TOOL TEXT" },
+{ type: "toolCall", id: "call-old", name: "read", arguments: {} },
+] as any,
+"toolUse",
+)
+const oldResult = {
+role: "toolResult",
+toolCallId: "call-old",
+toolName: "read",
+content: [{ type: "text", text: "OLD RAW RESULT".repeat(300) }],
+isError: false,
+timestamp: 3,
+}
+const currentAssistant = {
+...assistant(
+[{ type: "toolCall", id: "call-current", name: "read", arguments: {} }] as any,
+"toolUse",
+),
+usage: {
+input: 30_000,
+output: 100,
+cacheRead: 0,
+cacheWrite: 0,
+reasoning: 50,
+totalTokens: 30_100,
+cost: {},
+},
+}
+const currentResult = {
+role: "toolResult",
+toolCallId: "call-current",
+toolName: "read",
+content: [{ type: "text", text: "CURRENT RAW RESULT".repeat(100) }],
+isError: false,
+timestamp: 5,
+}
+const branchEntries = [
+{
+type: "message",
+id: "u1",
+message: { role: "user", content: "PERMANENT USER REQUIREMENT", timestamp: 1 },
+},
+{ type: "message", id: "a-old", message: oldAssistant },
+{ type: "message", id: "t-old", message: oldResult },
+{ type: "message", id: "a-current", message: currentAssistant },
+{ type: "message", id: "t-current", message: currentResult },
+]
+let responseIndex = 0
+const { handlers, ctx, calls } = setup({
+cwd: ws.cwd,
+branchEntries,
+messages: [
+{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+branchEntries[0].message,
+oldAssistant,
+oldResult,
+currentAssistant,
+currentResult,
+],
+contextUsage: { tokens: 42_500, contextWindow: 50_000, percent: 85 },
+model: { provider: "mock", id: "test-model", contextWindow: 50_000 },
+hasUI: true,
+response: async () =>
+responseIndex++ === 0
+? assistant([{ type: "text", text: "PARTIAL CACHED SUMMARY" }] as any, "length")
+: assistant([{ type: "text", text: "DELTA ONLY SUMMARY" }] as any),
+})
+handlers.get("before_provider_request")!(
+{
+type: "before_provider_request",
+payload: {
+model: "test-model",
+messages: [
+{ role: "system", content: "SYSTEM PROMPT" },
+branchEntries[0].message,
+oldAssistant,
+oldResult,
+],
+},
+},
+ctx,
+)
+
+const result = await handlers.get("turn_end")!(
+{
+type: "turn_end",
+turnIndex: 2,
+message: currentAssistant,
+toolResults: [currentResult],
+messageEntryId: "a-current",
+toolResultEntryIds: ["t-current"],
+entries: [],
+continue: false,
+},
+ctx,
+)
+
+assert.equal(calls.complete.length, 2)
+const cachedRequest = JSON.stringify(calls.complete[0].context.messages)
+const deltaOnlyRequest = JSON.stringify(calls.complete[1].context.messages)
+assert.match(cachedRequest, /PERMANENT USER REQUIREMENT/)
+assert.match(deltaOnlyRequest, /OLD RAW RESULT/)
+assert.doesNotMatch(deltaOnlyRequest, /CURRENT RAW RESULT/)
+assert.equal(
+calls.complete[1].context.messages[0].content,
+"Summarize the supplied technical context. Follow the final user instruction exactly.",
+)
+assert.ok(
+calls.notifications.some((notice) =>
+/cached summary hit its output limit; retrying with only the technical delta/.test(
+notice.message,
+),
+),
+)
+assert.ok(
+result.entries.some(
+(entry: any) => entry.type === "context_edit" && entry.targetId === "t-old",
+),
+)
+assert.equal(
+result.entries.some(
+(entry: any) => entry.type === "context_edit" && entry.targetId === "t-current",
+),
+false,
+)
+} finally {
+ws.cleanup()
+}
+})
+
+test("oversized technical delta compacts the oldest fitting prefix and carries the rest raw", async () => {
+    const debugFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cc-chunk-")), "debug.jsonl")
+    const ws = tempWorkspace({ preserveDialogue: true, debug: true, debugFile })
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const firstAssistant = assistant(
+[{ type: "toolCall", id: "call-first", name: "read", arguments: {} }] as any,
+"toolUse",
+)
+const firstResult = {
+role: "toolResult",
+toolCallId: "call-first",
+toolName: "read",
+content: [{ type: "text", text: "FIRST HUGE RAW " + "A".repeat(65_000) }],
+isError: false,
+timestamp: 3,
+}
+const secondAssistant = assistant(
+[{ type: "toolCall", id: "call-second", name: "read", arguments: {} }] as any,
+"toolUse",
+)
+const secondResult = {
+role: "toolResult",
+toolCallId: "call-second",
+toolName: "read",
+content: [{ type: "text", text: "SECOND HUGE RAW " + "B".repeat(65_000) }],
+isError: false,
+timestamp: 5,
+}
+const currentAssistant = {
+...assistant(
+[{ type: "toolCall", id: "call-current", name: "read", arguments: {} }] as any,
+"toolUse",
+),
+usage: {
+input: 56_000,
+output: 100,
+cacheRead: 0,
+cacheWrite: 0,
+reasoning: 50,
+totalTokens: 56_100,
+cost: {},
+},
+}
+const currentResult = {
+role: "toolResult",
+toolCallId: "call-current",
+toolName: "read",
+content: [{ type: "text", text: "CURRENT RAW" }],
+isError: false,
+timestamp: 7,
+}
+const branchEntries = [
+{
+type: "message",
+id: "u1",
+message: { role: "user", content: "KEEP USER", timestamp: 1 },
+},
+{ type: "message", id: "a-first", message: firstAssistant },
+{ type: "message", id: "t-first", message: firstResult },
+{ type: "message", id: "a-second", message: secondAssistant },
+{ type: "message", id: "t-second", message: secondResult },
+{ type: "message", id: "a-current", message: currentAssistant },
+{ type: "message", id: "t-current", message: currentResult },
+]
+const { handlers, ctx, calls } = setup({
+cwd: ws.cwd,
+branchEntries,
+messages: [
+{ role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+branchEntries[0].message,
+firstAssistant,
+firstResult,
+secondAssistant,
+secondResult,
+currentAssistant,
+currentResult,
+],
+contextUsage: { tokens: 60_000, contextWindow: 50_000, percent: 120 },
+model: { provider: "mock", id: "test-model", contextWindow: 50_000 },
+hasUI: true,
+response: assistant([{ type: "text", text: "FIRST CHUNK SUMMARY" }]),
+})
+handlers.get("before_provider_request")!(
+{
+type: "before_provider_request",
+payload: {
+model: "test-model",
+messages: [
+{ role: "system", content: "SYSTEM PROMPT" },
+branchEntries[0].message,
+firstAssistant,
+firstResult,
+secondAssistant,
+secondResult,
+],
+},
+},
+ctx,
+)
+
+const result = await handlers.get("turn_end")!(
+{
+type: "turn_end",
+turnIndex: 3,
+message: currentAssistant,
+toolResults: [currentResult],
+messageEntryId: "a-current",
+toolResultEntryIds: ["t-current"],
+entries: [],
+continue: false,
+},
+ctx,
+)
+
+assert.equal(calls.complete.length, 1)
+const request = JSON.stringify(calls.complete[0].context.messages)
+assert.match(request, /FIRST HUGE RAW/)
+assert.doesNotMatch(request, /SECOND HUGE RAW/)
+assert.equal(
+calls.complete[0].context.messages[0].content,
+"Summarize the supplied technical context. Follow the final user instruction exactly.",
+)
+assert.ok(
+calls.notifications.some((notice) =>
+/technical delta is too large for one summary/.test(notice.message),
+),
+)
+    const completeNotice = calls.notifications.find((notice) =>
+      notice.message.includes("compact complete: reserve threshold"),
+    )
+    assert.ok(completeNotice)
+    const audit = readRecords(debugFile).find((record) => record.kind === "preserve_compaction")
+    assert.ok(audit)
+    assert.ok(audit.tokens.tailAfterPrefix < audit.tokens.remainingRawCompactable)
+    assert.equal(
+      audit.tokens.estimatedContextAfterAnchored,
+      Math.max(0, audit.tokens.reportedPrefixTokens - audit.tokens.compactedRaw) +
+        audit.tokens.newCheckpoint +
+        audit.tokens.tailAfterPrefix,
+    )
+    const calibrationRatio = audit.tokens.providerCalibratedScale / audit.tokens.estimateScale
+    const calibratedRemainingRaw = Math.ceil(
+      audit.tokens.remainingRawCompactable * calibrationRatio,
+    )
+    assert.ok(audit.tokens.tailAfterPrefixCalibrated < calibratedRemainingRaw)
+    assert.equal(
+      audit.tokens.estimatedContextAfterAnchoredCalibrated,
+      Math.max(0, audit.tokens.reportedPrefixTokens - audit.tokens.compactedRawCalibrated) +
+        audit.tokens.newCheckpointCalibrated +
+        audit.tokens.tailAfterPrefixCalibrated,
+    )
+    const checkpoint = result.entries.at(-1)
+assert.equal(checkpoint.customType, "cache-compact-preserve-checkpoint")
+assert.equal(checkpoint.details.checkpoint.rawTailStartEntryId, "a-second")
+assert.ok(
+result.entries.some(
+(entry: any) => entry.type === "context_edit" && entry.targetId === "t-first",
+),
+)
+assert.equal(
+result.entries.some(
+(entry: any) => entry.type === "context_edit" && entry.targetId === "t-second",
+),
+false,
+)
+assert.equal(
+result.entries.some(
+(entry: any) => entry.type === "context_edit" && entry.targetId === "t-current",
+),
+false,
+)
+} finally {
+ws.cleanup()
+}
+})
+
 test("preserveDialogue reports reserve-threshold compaction and keeps the newest tool batch raw", async () => {
-  const ws = tempWorkspace({ preserveDialogue: true })
+  const debugFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cc-pressure-")), "debug.jsonl")
+  const ws = tempWorkspace({ preserveDialogue: true, debug: true, debugFile })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
   try {
     const branchEntries = [
@@ -750,6 +1091,14 @@ test("preserveDialogue reports reserve-threshold compaction and keeps the newest
             { type: "text", text: "PERMANENT LATEST ANSWER" },
             { type: "toolCall", id: "call-latest", name: "read", arguments: {} },
           ],
+          usage: {
+            input: 70_000,
+            output: 100,
+            cacheRead: 10_000,
+            cacheWrite: 500,
+            totalTokens: 80_600,
+            cost: {},
+          },
           timestamp: 4,
         },
       },
@@ -803,8 +1152,19 @@ test("preserveDialogue reports reserve-threshold compaction and keeps the newest
       /compact complete: reserve threshold/.test(notice.message),
     )
     assert.ok(completeNotice)
+    assert.match(completeNotice.message, /context before \(Pi usage\): 87026 tok/)
+    assert.match(completeNotice.message, /context after: ~\d+ tok \(provider-calibrated estimate\)/)
+    assert.equal(completeNotice.message.includes("conservative"), false)
     assert.match(completeNotice.message, /older raw compacted: ~[1-9]\d* tok/)
     assert.match(completeNotice.message, /newest raw kept: ~[1-9]\d* tok/)
+    const pressure = readRecords(debugFile).find(
+      (record) => record.kind === "dynamic_compaction_pressure",
+    )
+    assert.ok(pressure)
+        assert.equal(pressure.providerInputTokens, 70_000)
+    assert.equal(pressure.providerOutputTokens, 100)
+    assert.equal(pressure.providerCacheReadTokens, 10_000)
+    assert.equal(pressure.providerCacheWriteTokens, 500)
   } finally {
     ws.cleanup()
   }
@@ -1568,6 +1928,7 @@ test("honours a custom prompt, a summarizer model, and custom instructions", asy
     // Unset summaryReasoningEffort must leave the server's default effort
     // untouched — sending null/undefined explicitly would change the request.
     assert.equal("reasoningEffort" in calls.complete[0].options, false)
+assert.equal("toolChoice" in calls.complete[0].options, false)
     const askText = calls.complete[0].context.messages.at(-1).content[0].text
     assert.ok(askText.startsWith("CUSTOM HANDOFF\n\nDo not call any tools."))
     assert.match(askText, /Additional focus: focus on the tests/)
@@ -1601,27 +1962,29 @@ test("summary ask mirrors the last live reasoning effort, following mid-session 
     const { handler, providerHandler, ctx, calls } = setup({ cwd: ws.cwd })
 
     providerHandler(
-      { type: "before_provider_request", payload: { model: "m", reasoning_effort: "high" } },
+      { type: "before_provider_request", payload: { model: "m", reasoning_effort: "high", tool_choice: "auto" } },
       ctx,
     )
     await handler(event(), ctx)
     assert.equal(calls.complete[0].options.reasoningEffort, "high")
+assert.equal(calls.complete[0].options.toolChoice, "auto")
 
     // /thinking changed after the last observed live request: the cached
     // prefix is keyed by the newest live payload, so the next ask follows it.
     providerHandler(
-      { type: "before_provider_request", payload: { model: "m", reasoning_effort: "minimal" } },
+      { type: "before_provider_request", payload: { model: "m", reasoning_effort: "minimal", tool_choice: "none" } },
       ctx,
     )
     await handler(event(), ctx)
     assert.equal(calls.complete[1].options.reasoningEffort, "minimal")
+assert.equal(calls.complete[1].options.toolChoice, "none")
   } finally {
     ws.cleanup()
   }
 })
 
 test("omits effort when live requests omit it; config overrides observation", async () => {
-  const withOverride = tempWorkspace({ summaryReasoningEffort: "low" })
+  const withOverride = tempWorkspace({ summaryReasoningEffort: "low", toolChoice: "none" })
   const plain = tempWorkspace()
   try {
     // Live omits the effort -> the ask must omit it too (third cache variant).
@@ -1631,17 +1994,19 @@ test("omits effort when live requests omit it; config overrides observation", as
       providerHandler({ type: "before_provider_request", payload: { model: "m" } }, ctx)
       await handler(event(), ctx)
       assert.equal("reasoningEffort" in calls.complete[0].options, false)
+assert.equal("toolChoice" in calls.complete[0].options, false)
     }
     // Explicit config wins over whatever is on the wire.
     process.env.PI_CODING_AGENT_DIR = withOverride.agentDir
     {
       const { handler, providerHandler, ctx, calls } = setup({ cwd: withOverride.cwd })
       providerHandler(
-        { type: "before_provider_request", payload: { model: "m", reasoning_effort: "high" } },
+        { type: "before_provider_request", payload: { model: "m", reasoning_effort: "high", tool_choice: "auto" } },
         ctx,
       )
       await handler(event(), ctx)
       assert.equal(calls.complete[0].options.reasoningEffort, "low")
+assert.equal(calls.complete[0].options.toolChoice, "none")
     }
   } finally {
     withOverride.cleanup()
@@ -1721,7 +2086,16 @@ test("debug records the compaction lifecycle to debugFile", async () => {
   const ws = tempWorkspace({ preserveDialogue: true, debug: true, debugFile })
   process.env.PI_CODING_AGENT_DIR = ws.agentDir
   try {
-    const { handler, providerHandler, ctx } = setup({ cwd: ws.cwd })
+    const liveAssistant = assistant([{ type: "text", text: "hi" }])
+    const { handler, providerHandler, ctx } = setup({
+      cwd: ws.cwd,
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT", timestamp: 0 },
+        { role: "user", content: "hello from the session", timestamp: 1 },
+        liveAssistant,
+        { role: "user", content: "recent kept message", timestamp: 3 },
+      ],
+    })
     providerHandler(
       {
         type: "before_provider_request",
@@ -1735,7 +2109,13 @@ test("debug records the compaction lifecycle to debugFile", async () => {
       },
       ctx,
     )
-    await handler(preserveEvent(), ctx)
+    await handler(
+      preserveEvent({
+        preservePrefixTokens: 20_000,
+        preparation: { firstKeptEntryId: "keep-1", tokensBefore: 25_000 } as any,
+      }),
+      ctx,
+    )
     providerHandler(
       {
         type: "before_provider_request",
@@ -1759,33 +2139,50 @@ test("debug records the compaction lifecycle to debugFile", async () => {
     assert.ok(start, "no summary_start record")
     assert.equal(start.sessionId, "sess-1")
     assert.equal(start.askHash.length, 12)
-    assert.equal(start.tokensBefore, 1234)
+    assert.equal(start.tokensBefore, 25_000)
     assert.ok(result, "no summary_result record")
     assert.equal(result.chars, "MOCK SUMMARY".length)
     assert.equal(result.cacheRead, 5)
     assert.equal(typeof result.durationMs, "number")
     assert.ok(audit, "no canonical preserve_compaction audit record")
     assert.equal(audit.checkpoint.number, 1)
-    assert.ok(Array.isArray(audit.contextBefore))
-    assert.ok(Array.isArray(audit.contextAfter))
+    assert.equal(audit.contextBefore, undefined)
+    assert.equal(audit.contextAfter, undefined)
     assert.ok(Array.isArray(audit.contextIndex.before))
     assert.ok(Array.isArray(audit.contextIndex.after))
     assert.equal(typeof audit.contextIndex.before[0]?.estimatedTokens, "number")
     assert.ok(Array.isArray(audit.toolDeclarations))
     assert.equal(typeof audit.tokens.providerContextBefore, "number")
+    assert.equal(typeof audit.tokens.providerCalibratedScale, "number")
     assert.equal(typeof audit.tokens.providerPromptOverhead, "number")
     assert.equal(typeof audit.tokens.estimatedSystemPrompt, "number")
     assert.equal(typeof audit.tokens.estimatedToolDeclarations, "number")
     assert.equal(typeof audit.tokens.estimatedOtherProviderOverhead, "number")
     assert.equal(typeof audit.tokens.estimatedContextAfter, "number")
+    assert.equal(typeof audit.tokens.estimatedContextAfterCalibrated, "number")
+    assert.equal(typeof audit.tokens.compactedRawCalibrated, "number")
+    assert.equal(typeof audit.tokens.newCheckpointCalibrated, "number")
+    assert.equal(audit.tokens.reportedPrefixTokens, 20_000)
+    assert.ok(audit.tokens.providerCalibratedScale < audit.tokens.estimateScale)
+    const anchoredCalibrated =
+      Math.max(0, audit.tokens.reportedPrefixTokens - audit.tokens.compactedRawCalibrated) +
+      audit.tokens.newCheckpointCalibrated +
+      audit.tokens.tailAfterPrefixCalibrated
+    assert.equal(audit.tokens.estimatedContextAfterAnchoredCalibrated, anchoredCalibrated)
+    assert.ok(audit.tokens.estimatedContextAfterCalibrated >= anchoredCalibrated)
     assert.equal(typeof audit.tokens.preservedUserMessages, "number")
     assert.equal(typeof audit.tokens.preservedAssistantText, "number")
     assert.equal(typeof audit.tokens.newRawCompactable, "number")
     assert.equal(audit.tokens.remainingRawCompactable, 0)
     assert.ok(Array.isArray(audit.scope.rawEntryIds))
     assert.ok(post, "no actual post_compaction_context record")
-    assert.ok(Array.isArray(post.context.messages))
+    assert.equal(post.context.messages, undefined)
+    assert.ok(Array.isArray(post.context.messageIndex))
+    assert.equal(typeof post.context.messageIndex[0]?.hash, "string")
+    assert.equal(typeof post.context.messageIndex[0]?.estimatedTokens, "number")
+    assert.equal("content" in post.context.messageIndex[0], false)
     assert.equal(typeof post.cachePrefix.stableMessages, "number")
+    assert.doesNotMatch(fs.readFileSync(debugFile, "utf8"), /after checkpoint/)
   } finally {
     ws.cleanup()
   }
@@ -2184,6 +2581,7 @@ test("summary provider errors use Pi settings.retry before preserve compaction f
     let attempt = 0
     const { handler, ctx, calls } = setup({
       cwd: ws.cwd,
+      hasUI: true,
       response: async () => {
         attempt += 1
         if (attempt < 3) {
@@ -2212,6 +2610,16 @@ test("summary provider errors use Pi settings.retry before preserve compaction f
     const finished = records.find((record) => record.kind === "summary_provider_retry_finished")
     assert.equal(finished?.success, true)
     assert.equal(finished?.attempt, 2)
+    assert.ok(
+    calls.notifications.some((notice) =>
+    notice.message.includes("summary provider retry 1/2 in 1ms"),
+    ),
+    )
+    assert.ok(
+    calls.notifications.some((notice) =>
+    notice.message.includes("summary provider retry 2/2 in 1ms"),
+    ),
+    )
   } finally {
     ws.cleanup()
   }
@@ -2257,25 +2665,46 @@ test("retries once when the reply stopped with no text, then gives up", async ()
   }
 })
 
-test("does not retry failures that would repeat (token cap, tool call, abort)", async () => {
-  for (const [response, pattern] of [
-    [assistant([{ type: "text", text: "partial" }], "length"), /token cap/],
-    [
-      assistant([{ type: "toolCall", id: "1", name: "read", arguments: {} }] as any, "toolUse"),
-      /call a tool/,
-    ],
-    [assistant([{ type: "text", text: "x" }], "aborted"), /aborted/],
-  ] as const) {
-    const ws = tempWorkspace()
-    process.env.PI_CODING_AGENT_DIR = ws.agentDir
-    try {
-      const { handler, ctx, calls } = setup({ cwd: ws.cwd, response })
-      assert.equal(await handler(event(), ctx), undefined)
-      assert.equal(calls.complete.length, 1, `retried a ${pattern} failure`)
-    } finally {
-      ws.cleanup()
-    }
-  }
+test("retries once when the summarizer returns a parsed tool call", async () => {
+const ws = tempWorkspace()
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+let attempt = 0
+const { handler, ctx, calls } = setup({
+cwd: ws.cwd,
+response: async () => {
+attempt += 1
+return attempt === 1
+? assistant([{ type: "toolCall", id: "1", name: "read", arguments: {} }] as any, "toolUse")
+: assistant([{ type: "text", text: "TOOL-CALL RETRY SUMMARY" }])
+},
+})
+const result = (await handler(preserveEvent(), ctx)) as any
+assert.equal(calls.complete.length, 2)
+assert.equal(result.compaction.summary, "TOOL-CALL RETRY SUMMARY")
+assert.match(calls.complete[1].context.messages.at(-1).content[0].text, /Do not call any tools/)
+assert.equal("toolChoice" in calls.complete[0].options, false)
+assert.equal(calls.complete[1].options.toolChoice, "none")
+} finally {
+ws.cleanup()
+}
+})
+
+test("does not retry terminal summary failures that would repeat (token cap, abort)", async () => {
+for (const [response, pattern] of [
+[assistant([{ type: "text", text: "partial" }], "length"), /token cap/],
+[assistant([{ type: "text", text: "x" }], "aborted"), /aborted/],
+] as const) {
+const ws = tempWorkspace()
+process.env.PI_CODING_AGENT_DIR = ws.agentDir
+try {
+const { handler, ctx, calls } = setup({ cwd: ws.cwd, response })
+assert.equal(await handler(event(), ctx), undefined)
+assert.equal(calls.complete.length, 1, `retried a ${pattern} failure`)
+} finally {
+ws.cleanup()
+}
+}
 })
 
 test("an empty reply retried into another empty reply falls back to Pi", async () => {
